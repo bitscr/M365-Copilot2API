@@ -1728,7 +1728,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if prompt == "" {
+	if prompt == "" && len(body.Attachments) == 0 {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "messages required")
 		return
 	}
