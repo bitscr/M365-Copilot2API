@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -90,6 +91,37 @@ func TestResponsesTextSSEPreservesMarkdownAndIncrementalDeltas(t *testing.T) {
 	}
 	if done != want {
 		t.Fatalf("done text differs from deltas:\nwant %q\n got %q", want, done)
+	}
+	// The three-way invariant a client relies on to rebuild the answer:
+	// concatenated deltas == output_text.done.text == the text on the
+	// completed response. A mismatch is what corrupted the rendered Markdown.
+	var completed string
+	for _, line := range strings.Split(rr.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
+			t.Fatal(err)
+		}
+		if event["type"] != "response.completed" {
+			continue
+		}
+		resp, _ := event["response"].(map[string]any)
+		output, _ := resp["output"].([]any)
+		if len(output) == 0 {
+			t.Fatal("completed response has no output")
+		}
+		item, _ := output[0].(map[string]any)
+		content, _ := item["content"].([]any)
+		if len(content) == 0 {
+			t.Fatal("completed response item has no content")
+		}
+		part, _ := content[0].(map[string]any)
+		completed = fmt.Sprint(part["text"])
+	}
+	if completed != want {
+		t.Fatalf("completed response text differs from deltas:\nwant %q\n got %q", want, completed)
 	}
 }
 
