@@ -622,19 +622,35 @@ func (s *Server) adminKeys(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// rawAPIKey returns the full API key presented by the caller (X-API-Key or
-// Authorization: Bearer), or "" when none is present. Unlike extractAPIKey it
-// does not truncate: callers that use the key as a tenant/isolation identity
-// need the complete secret so distinct keys never collide on a shared prefix.
-func rawAPIKey(r *http.Request) string {
-	raw := strings.TrimSpace(r.Header.Get("X-API-Key"))
-	if raw == "" {
-		v := r.Header.Get("Authorization")
-		if strings.HasPrefix(strings.ToLower(v), "bearer ") {
-			raw = strings.TrimSpace(v[7:])
+// apiKeyHeaderNames are the header names a client may use to present the
+// gateway API key. Codex CLI and CC Switch send "api-key" (an OpenAI SDK
+// legacy header), the OpenAI JS/Python SDKs send "Authorization: Bearer",
+// and the web console sends "X-API-Key". All must be accepted or agent
+// clients fail with 401 even though the key is valid.
+var apiKeyHeaderNames = []string{"X-API-Key", "api-key", "Api-Key", "x-api-key"}
+
+func presentedAPIKey(r *http.Request) (string, bool) {
+	for _, name := range apiKeyHeaderNames {
+		if v := strings.TrimSpace(r.Header.Get(name)); v != "" {
+			return v, true
 		}
 	}
-	return raw
+	if v := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(strings.ToLower(v), "bearer ") {
+		return strings.TrimSpace(v[7:]), true
+	}
+	return "", false
+}
+
+// rawAPIKey returns the full API key presented by the caller (X-API-Key,
+// api-key, or Authorization: *** or "" when none is present. Unlike
+// extractAPIKey it does not truncate: callers that use the key as a
+// tenant/isolation identity need the complete secret so distinct keys never
+// collide on a shared prefix.
+func rawAPIKey(r *http.Request) string {
+	if raw, ok := presentedAPIKey(r); ok {
+		return raw
+	}
+	return ""
 }
 
 func (s *Server) validAPIKey(r *http.Request) bool {
@@ -2839,14 +2855,7 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 }
 
 func extractAPIKey(r *http.Request) string {
-	key := strings.TrimSpace(r.Header.Get("X-API-Key"))
-	if key != "" {
-		return key
-	}
-	auth := r.Header.Get("Authorization")
-	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
-		key = strings.TrimSpace(auth[7:])
-	}
+	key, _ := presentedAPIKey(r)
 	if len(key) > 8 {
 		return key[:8] + "..."
 	}
