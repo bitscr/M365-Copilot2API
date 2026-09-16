@@ -1511,8 +1511,18 @@ async function openUseKey(id){
   const rec=(d.keys||[]).find(x=>x.id===id);
   if(!rec){showNotice('找不到密钥','error');return;}
   $('useKeyName').textContent='当前密钥：'+rec.name+' ('+rec.prefix+')';
-  $('useKeyVal').value=rec.raw||'';
+  // The list response no longer carries the secret; reveal it explicitly.
+  // Legacy unrecoverable keys keep working as before: fall back to the
+  // prefix so the modal still renders, and the user is told to rotate.
+  useKeyPrefix=rec.prefix||'';
+  $('useKeyVal').value=useKeyPrefix;
+  let revealed=false;
+  try{
+    const r=await api('/api/admin/keys?id='+encodeURIComponent(id));
+    if(r.key){$('useKeyVal').value=r.key;revealed=true;}
+  }catch(e){}
   $('useKeyModal').classList.add('open');
+  if(!revealed)showNotice('此密钥明文不可恢复（创建于查看功能上线前），配置示例仅含前缀——请在 Edit 中更换密钥','error');
   renderUkeTabs();
   renderUkeFiles();
 }
