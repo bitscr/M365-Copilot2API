@@ -653,14 +653,46 @@ if (response.output_text) {
 <div class="modal-overlay" id="editKeyModal">
   <div class="modal">
     <h3>Edit API key</h3>
-    <p class="subtitle">Change the key name</p>
+    <p class="subtitle">修改密钥名称，或更换密钥值</p>
     <div class="form-group">
       <label class="form-label">Name</label>
       <input class="form-input" id="editKeyName">
     </div>
+    <div class="form-group">
+      <label class="form-label">Key value</label>
+      <div class="copy-field">
+        <input class="form-input" id="editKeyValue" placeholder="填写则替换密钥" oninput="regenRequested = this.value.trim() !== ''">
+        <button type="button" class="btn-sm btn" onclick="regenEditKey()">自动生成</button>
+      </div>
+      <div class="form-hint">留空保存则不修改密钥；点「自动生成」或手填则替换。自定义密钥须以 <code>m365_</code> 开头，后接至少 32 位十六进制字符。</div>
+    </div>
     <div class="modal-actions">
       <button class="btn" onclick="closeEditKeyModal()">Cancel</button>
       <button class="btn primary" onclick="saveEditKey()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- View Key Modal -->
+<div class="modal-overlay" id="viewKeyModal">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h3>View API key</h3>
+        <p class="subtitle" id="viewKeyName"></p>
+      </div>
+      <button class="modal-close" onclick="closeViewKey()"><i data-lucide="x" style="width:15px;height:15px"></i></button>
+    </div>
+    <div id="viewKeyLoading" style="color:var(--muted);font-size:13px">Loading…</div>
+    <div id="viewKeyResult" style="display:none">
+      <div class="copy-field">
+        <input class="form-input" id="viewKeyValue" readonly onclick="this.select()">
+        <button class="btn btn-sm" onclick="copyViewKey()">Copy</button>
+      </div>
+      <div class="form-hint" style="margin-top:10px">此密钥以明文保存于服务器（文件权限 0600），可随时在此查看。若泄露，请在 Edit 中更换。</div>
+    </div>
+    <div id="viewKeyLegacy" style="display:none">
+      <div class="highlight-box">此密钥创建于可查看功能上线之前，明文无法恢复。请在 Edit 中更换密钥以获取可查看的值。</div>
     </div>
   </div>
 </div>
@@ -1259,12 +1291,13 @@ async function loadKeys(){
     if(!k.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=6;td.className='empty';td.textContent='No API keys';tr.append(td);rows.append(tr);return;}
     k.forEach(x=>{
       const tr=document.createElement('tr');
-      tr.innerHTML=`<td><b></b></td><td><code></code></td><td class="key-created" style="font-size:12px;color:var(--muted)"></td><td><span class="status ${x.revoked?'offline':'online'}"><i></i>${x.revoked?'Disabled':'Active'}</span></td><td class="key-last-used" style="font-size:12px;color:var(--muted)"></td><td style="text-align:right;white-space:nowrap"><button class="btn-sm btn" data-key-action="use">Use key</button><button class="btn-sm btn" data-key-action="edit">Edit</button><button class="btn-sm btn ${x.revoked?'success':'danger'}" data-key-action="toggle">${x.revoked?'Enable':'Disable'}</button><button class="btn-sm btn danger" data-key-action="delete">Delete</button></td>`;
+      tr.innerHTML=`<td><b></b></td><td><code></code></td><td class="key-created" style="font-size:12px;color:var(--muted)"></td><td><span class="status ${x.revoked?'offline':'online'}"><i></i>${x.revoked?'Disabled':'Active'}</span></td><td class="key-last-used" style="font-size:12px;color:var(--muted)"></td><td style="text-align:right;white-space:nowrap"><button class="btn-sm btn" data-key-action="use">Use key</button><button class="btn-sm btn" data-key-action="view">View key</button><button class="btn-sm btn" data-key-action="edit">Edit</button><button class="btn-sm btn ${x.revoked?'success':'danger'}" data-key-action="toggle">${x.revoked?'Enable':'Disable'}</button><button class="btn-sm btn danger" data-key-action="delete">Delete</button></td>`;
       tr.querySelector('b').textContent=x.name||'';
       tr.querySelector('code').textContent=x.prefix||'';
       tr.querySelector('.key-created').textContent=new Date(x.createdAt).toLocaleString();
       tr.querySelector('.key-last-used').textContent=x.lastUsedAt?new Date(x.lastUsedAt).toLocaleString():'-';
       tr.querySelector('[data-key-action="use"]').addEventListener('click',()=>openUseKey(x.id));
+      tr.querySelector('[data-key-action="view"]').addEventListener('click',()=>viewKey(x.id,x.name));
       tr.querySelector('[data-key-action="edit"]').addEventListener('click',()=>editKey(x.id,x.name));
       tr.querySelector('[data-key-action="toggle"]').addEventListener('click',()=>toggleKey(x.id,x.revoked));
       tr.querySelector('[data-key-action="delete"]').addEventListener('click',()=>revokeKey(x.id));
@@ -1274,14 +1307,50 @@ async function loadKeys(){
 }
 
 let editKeyId=null;
-function editKey(id,name){editKeyId=id;$('editKeyName').value=name;$('editKeyModal').classList.add('open');setTimeout(()=>$('editKeyName').focus(),50);}
-function closeEditKeyModal(){$('editKeyModal').classList.remove('open');editKeyId=null;}
+let regenRequested=false;
+let viewKeyId=null;
+function editKey(id,name){editKeyId=id;$('editKeyName').value=name;$('editKeyValue').value='';$('editKeyModal').classList.add('open');setTimeout(()=>$('editKeyName').focus(),50);}
+function closeEditKeyModal(){$('editKeyModal').classList.remove('open');editKeyId=null;$('editKeyValue').value='';}
+// regenEditKey fills the field with a fresh client-side key so the admin can
+// see the exact value that will be saved. The server generates one too when
+// the field is left empty.
+function regenEditKey(){
+  const a=new Uint8Array(32);crypto.getRandomValues(a);
+  $('editKeyValue').value='m365_'+Array.from(a,b=>b.toString(16).padStart(2,'0')).join('');
+  regenRequested=true;
+}
 async function saveEditKey(){
   const name=$('editKeyName').value.trim();
   if(!name)return showNotice('名称不能为空','error');
-  try{await api('/api/admin/keys',{method:'PUT',body:JSON.stringify({id:editKeyId,name})});closeEditKeyModal();showNotice('已更新','success');loadKeys();}
+  const body={id:editKeyId,name};
+  // Only send a key when the admin actually wants to change it. An empty box
+  // with the "generate" button untouched means "keep the existing secret".
+  const stale=$('editKeyValue').value.trim();
+  if(regenRequested){body.key=stale;}
+  try{const d=await api('/api/admin/keys',{method:'PUT',body:JSON.stringify(body)});if(d.key){$('keyValue').value=d.key;$('viewKeyValue').value=d.key;showNotice('密钥已更换，请立即复制保存','success');}else{showNotice('已更新','success');}regenRequested=false;closeEditKeyModal();loadKeys();}
   catch(e){showNotice(e.message,'error');}
 }
+
+async function viewKey(id,name){
+  viewKeyId=id;
+  $('viewKeyName').textContent=name||'';
+  $('viewKeyLoading').style.display='block';
+  $('viewKeyResult').style.display='none';
+  $('viewKeyLegacy').style.display='none';
+  $('viewKeyModal').classList.add('open');
+  try{
+    const d=await api('/api/admin/keys?id='+encodeURIComponent(id));
+    $('viewKeyValue').value=d.key||'';
+    $('viewKeyLoading').style.display='none';
+    $('viewKeyResult').style.display='block';
+  }catch(e){
+    $('viewKeyLoading').style.display='none';
+    if(/(not_recoverable|无法|before reveal)/i.test(e.message||'')){$('viewKeyLegacy').style.display='block';}
+    else{showNotice(e.message,'error');}
+  }
+}
+function closeViewKey(){$('viewKeyModal').classList.remove('open');viewKeyId=null;}
+async function copyViewKey(){try{await navigator.clipboard.writeText($('viewKeyValue').value);showNotice('已复制','success');}catch(e){}}
 async function toggleKey(id,revoked){
   try{await api('/api/admin/keys',{method:'PUT',body:JSON.stringify({id,revoked:!revoked})});showNotice(revoked?'Enabled':'Disabled','success');loadKeys();}
   catch(e){showNotice(e.message,'error');}

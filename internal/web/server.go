@@ -567,6 +567,23 @@ func (s *Server) adminSession(w http.ResponseWriter, r *http.Request) {
 func (s *Server) adminKeys(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		// ?id=<id> reveals one key's full secret; without it the list is
+		// returned with the secret omitted.
+		if id := strings.TrimSpace(r.URL.Query().Get("id")); id != "" {
+			raw, found, recoverable := s.apiKeys.reveal(id)
+			if !found {
+				writeOpenAIError(w, 404, "not_found", "key not found")
+				return
+			}
+			if !recoverable {
+				// Legacy record hashed before raw storage existed. The plaintext
+				// is unrecoverable by design; the console offers rotation instead.
+				writeOpenAIError(w, http.StatusConflict, "not_recoverable", "key was created before reveal support; rotate it to get a viewable value")
+				return
+			}
+			jsonOut(w, map[string]any{"key": raw})
+			return
+		}
 		jsonOut(w, map[string]any{"keys": s.apiKeys.list()})
 	case http.MethodPost:
 		var b struct {
@@ -602,21 +619,51 @@ func (s *Server) adminKeys(w http.ResponseWriter, r *http.Request) {
 			ID      string `json:"id"`
 			Name    string `json:"name"`
 			Revoked *bool  `json:"revoked"`
+			// Key, when non-nil, replaces the key material. An empty string asks
+			// the server to generate a fresh random key; a non-empty value is
+			// used verbatim after validation.
+			Key *string `json:"key"`
 		}
 		if json.NewDecoder(r.Body).Decode(&b) != nil || b.ID == "" {
 			writeOpenAIError(w, 400, "invalid_request_error", "bad json")
 			return
 		}
-		updated, e := s.apiKeys.update(b.ID, b.Name, b.Revoked)
-		if e != nil {
-			writeOpenAIError(w, http.StatusInternalServerError, "internal_error", e.Error())
-			return
+		var newKey string
+		if b.Key != nil {
+			if v := strings.TrimSpace(*b.Key); v != "" {
+				if err := validateCustomKey(v); err != nil {
+					writeOpenAIError(w, 400, "invalid_request_error", err.Error())
+					return
+				}
+			}
+			rec, raw, e := s.apiKeys.setRaw(b.ID, *b.Key)
+			if e == errKeyNotFound {
+				writeOpenAIError(w, 404, "not_found", "key not found")
+				return
+			}
+			if e != nil {
+				writeOpenAIError(w, http.StatusInternalServerError, "internal_error", e.Error())
+				return
+			}
+			_ = rec
+			newKey = raw
 		}
-		if !updated {
-			writeOpenAIError(w, 404, "not_found", "key not found")
-			return
+		if b.Name != "" || b.Revoked != nil {
+			updated, e := s.apiKeys.update(b.ID, b.Name, b.Revoked)
+			if e != nil {
+				writeOpenAIError(w, http.StatusInternalServerError, "internal_error", e.Error())
+				return
+			}
+			if !updated && b.Key == nil {
+				writeOpenAIError(w, 404, "not_found", "key not found")
+				return
+			}
 		}
-		jsonOut(w, map[string]string{"status": "updated"})
+		out := map[string]any{"status": "updated"}
+		if b.Key != nil {
+			out["key"] = newKey
+		}
+		jsonOut(w, out)
 	default:
 		writeOpenAIError(w, 405, "invalid_request_error", "method not allowed")
 	}

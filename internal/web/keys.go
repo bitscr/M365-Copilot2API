@@ -5,12 +5,26 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 )
+
+// errKeyNotFound is returned by mutators when the requested record is gone.
+var errKeyNotFound = errors.New("key not found")
+
+// publicKeyPrefix is the display prefix shown in the console (m365_ + 6 hex).
+// It stays stable for the same secret so the UI can match a row to a key.
+func publicKeyPrefix(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if len(raw) <= 12 {
+		return raw
+	}
+	return raw[:12]
+}
 
 type apiKeyRecord struct {
 	ID         string     `json:"id"`
@@ -44,13 +58,15 @@ func openAPIKeys() *apiKeyStore {
 	s := newAPIKeyStore(p)
 	b, e := os.ReadFile(p)
 	if e == nil && json.Unmarshal(b, s) == nil {
+		// Repair records written before hashing existed: derive the hash from
+		// the stored plaintext. Raw is KEPT so the console can reveal the key
+		// later; the file is already mode 0600 and the same directory holds
+		// OAuth tokens.
 		migrated := false
 		for i := range s.Keys {
-			if s.Keys[i].Raw != "" {
-				if s.Keys[i].Hash == "" {
-					s.Keys[i].Hash = keyHash(s.Keys[i].Raw)
-				}
-				s.Keys[i].Raw = ""
+			if s.Keys[i].Hash == "" && s.Keys[i].Raw != "" {
+				s.Keys[i].Hash = keyHash(s.Keys[i].Raw)
+				s.Keys[i].Prefix = publicKeyPrefix(s.Keys[i].Raw)
 				migrated = true
 			}
 		}
@@ -73,13 +89,35 @@ func (s *apiKeyStore) flush() error {
 	return writeFileAtomic(s.Path, b, 0600)
 }
 func keyHash(k string) string { h := sha256.Sum256([]byte(k)); return hex.EncodeToString(h[:]) }
+
+// validateCustomKey enforces the shape of a caller-supplied replacement key.
+// A custom value must keep the m365_ namespace and stay hex so keys remain
+// interchangeable with generated ones and never collide on a display prefix.
+func validateCustomKey(raw string) error {
+	if !strings.HasPrefix(raw, "m365_") {
+		return errors.New("key must start with m365_")
+	}
+	body := raw[len("m365_"):]
+	if len(body) < 32 {
+		return errors.New("key body must be at least 32 hex characters")
+	}
+	if len(body) > 128 {
+		return errors.New("key body must be at most 128 hex characters")
+	}
+	if _, err := hex.DecodeString(body); err != nil {
+		return errors.New("key body must be hexadecimal")
+	}
+	return nil
+}
 func (s *apiKeyStore) create(name string) (apiKeyRecord, string, error) {
 	b := make([]byte, 32)
 	if _, e := rand.Read(b); e != nil {
 		return apiKeyRecord{}, "", e
 	}
 	raw := "m365_" + hex.EncodeToString(b)
-	r := apiKeyRecord{ID: hex.EncodeToString(b[:8]), Name: name, Prefix: raw[:12], Hash: keyHash(raw), CreatedAt: time.Now()}
+	// Raw is persisted so the console can reveal the key after creation. The
+	// store file is mode 0600 and already holds OAuth refresh tokens.
+	r := apiKeyRecord{ID: hex.EncodeToString(b[:8]), Name: name, Prefix: publicKeyPrefix(raw), Hash: keyHash(raw), Raw: raw, CreatedAt: time.Now()}
 	s.mu.Lock()
 	s.Keys = append(s.Keys, r)
 	s.mu.Unlock()
@@ -99,10 +137,77 @@ func (s *apiKeyStore) list() []apiKeyRecord {
 	out := make([]apiKeyRecord, len(s.Keys))
 	copy(out, s.Keys)
 	for i := range out {
-		out[i].Hash = ""
+		// Raw is never included in list responses: the console asks for it
+		// explicitly via reveal() so the full secret does not ride along in
+		// every dashboard refresh (browser history, proxy logs, devtools).
 		out[i].Raw = ""
+		out[i].Hash = ""
 	}
 	return out
+}
+
+// reveal returns the full plaintext key for an active or disabled record.
+// Keys created before raw storage was added have no recoverable value; the
+// caller must rotate those instead (ok=false, recoverable=false).
+func (s *apiKeyStore) reveal(id string) (raw string, found, recoverable bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.Keys {
+		if s.Keys[i].ID != id {
+			continue
+		}
+		if s.Keys[i].Raw == "" {
+			return "", true, false
+		}
+		return s.Keys[i].Raw, true, true
+	}
+	return "", false, false
+}
+
+// setRaw replaces the key material for a record, preserving its ID and
+// creation time. Passing an empty custom value generates a fresh random key.
+// The caller is responsible for validating a caller-supplied value.
+func (s *apiKeyStore) setRaw(id, custom string) (apiKeyRecord, string, error) {
+	raw := strings.TrimSpace(custom)
+	if raw == "" {
+		b := make([]byte, 32)
+		if _, e := rand.Read(b); e != nil {
+			return apiKeyRecord{}, "", e
+		}
+		raw = "m365_" + hex.EncodeToString(b)
+	}
+	s.mu.Lock()
+	idx := -1
+	for i := range s.Keys {
+		if s.Keys[i].ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		s.mu.Unlock()
+		return apiKeyRecord{}, "", errKeyNotFound
+	}
+	oldRaw, oldPrefix, oldHash := s.Keys[idx].Raw, s.Keys[idx].Prefix, s.Keys[idx].Hash
+	s.Keys[idx].Raw = raw
+	s.Keys[idx].Prefix = publicKeyPrefix(raw)
+	s.Keys[idx].Hash = keyHash(raw)
+	rec := s.Keys[idx]
+	s.mu.Unlock()
+	if err := s.persist.flushNowBlocking(); err != nil {
+		s.mu.Lock()
+		for i := range s.Keys {
+			if s.Keys[i].ID == id {
+				s.Keys[i].Raw, s.Keys[i].Prefix, s.Keys[i].Hash = oldRaw, oldPrefix, oldHash
+				break
+			}
+		}
+		s.mu.Unlock()
+		return apiKeyRecord{}, "", err
+	}
+	rec.Raw = ""
+	rec.Hash = ""
+	return rec, raw, nil
 }
 func (s *apiKeyStore) revoke(id string) (bool, error) {
 	s.mu.Lock()
