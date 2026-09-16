@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -37,9 +38,15 @@ type apiKeyRecord struct {
 	Revoked    bool       `json:"revoked"`
 }
 type apiKeyStore struct {
-	mu      sync.Mutex
-	Path    string
-	Keys    []apiKeyRecord `json:"keys"`
+	mu   sync.Mutex
+	Keys []apiKeyRecord `json:"keys"`
+	// Path is runtime state resolved from M365_API_KEYS at startup. It must
+	// NEVER be serialized: a previously embedded relative value used to
+	// override the env-var path on load, so flushes landed in whatever
+	// directory the process happened to run in. That divergence let one
+	// stale snapshot overwrite the live key set at restart.
+	Path string `json:"-"`
+
 	persist *persistStore
 }
 
@@ -85,6 +92,11 @@ func (s *apiKeyStore) flush() error {
 	}
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0700); err != nil {
 		return err
+	}
+	// Keep one snapshot of the previous content: an accidental bad write
+	// (stale process, wrong path) stays one rename away from being undone.
+	if old, e := os.ReadFile(s.Path); e == nil && !bytes.Equal(old, b) {
+		_ = writeFileAtomic(s.Path+".bak", old, 0600)
 	}
 	return writeFileAtomic(s.Path, b, 0600)
 }
