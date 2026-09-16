@@ -621,7 +621,13 @@ if (response.output_text) {
       <!-- Settings -->
       <section id="page-settings" style="display:none">
         <h2 style="font-size:18px;font-weight:700;margin-bottom:16px">Settings</h2>
-        <div class="card"><div class="card-body"><div class="form-group"><label class="form-label">Listen address</label><input class="form-input" id="setListen" placeholder="127.0.0.1:4141"></div><div class="form-group"><label class="form-label">Chat timeout (seconds)</label><input class="form-input" id="setTimeout" type="number" placeholder="120"></div><div class="form-group"><label class="form-label" for="languageSelect">Language</label><select class="form-input" id="languageSelect"><option value="en">English</option><option value="zh-CN">简体中文</option><option value="zh-TW">繁體中文</option><option value="ja">日本語</option><option value="ko">한국어</option><option value="es">Español</option><option value="fr">Français</option><option value="de">Deutsch</option><option value="pt-BR">Português (Brasil)</option><option value="ru">Русский</option><option value="ar">العربية</option></select><p class="form-hint">Choose the language used by the administration console.</p></div><div style="margin-top:16px"><button class="btn primary" onclick="saveSettings()">Save settings</button></div></div></div>
+        <div class="card"><div class="card-body"><div class="form-group"><label class="form-label">Listen address</label><input class="form-input" id="setListen" placeholder="0.0.0.0:4141"></div><div class="form-group"><label class="form-label">Chat timeout (seconds)</label><input class="form-input" id="setTimeout" type="number" placeholder="120"></div><div class="form-group"><label class="form-label" for="languageSelect">Language</label><select class="form-input" id="languageSelect"><option value="en">English</option><option value="zh-CN">简体中文</option><option value="zh-TW">繁體中文</option><option value="ja">日本語</option><option value="ko">한국어</option><option value="es">Español</option><option value="fr">Français</option><option value="de">Deutsch</option><option value="pt-BR">Português (Brasil)</option><option value="ru">Русский</option><option value="ar">العربية</option></select><p class="form-hint">Choose the language used by the administration console.</p></div><div style="margin-top:16px"><button class="btn primary" onclick="saveSettings()">Save settings</button></div></div></div><div class="card" style="margin-top:16px"><div class="card-body">
+<h3 style="font-size:15px;font-weight:600;margin:0 0 14px">修改管理员密码 / Change admin password</h3>
+<div class="form-group"><label class="form-label">当前密码 / Current password</label><input class="form-input" id="cpCurrent" type="password" autocomplete="current-password"></div>
+<div class="form-group"><label class="form-label">新密码 / New password</label><input class="form-input" id="cpNew" type="password" autocomplete="new-password" minlength="6"><p class="form-hint">至少 6 个字符。修改后所有已登录会话失效，需用新密码重新登录。</p></div>
+<div class="form-group"><label class="form-label">确认新密码 / Confirm new password</label><input class="form-input" id="cpConfirm" type="password" autocomplete="new-password" minlength="6"></div>
+<div style="margin-top:16px"><button class="btn primary" onclick="changeAdminPassword()">修改密码 / Change password</button></div>
+</div></div>
       </section>
     </div>
   </main>
@@ -1794,6 +1800,19 @@ async function saveSettings(){
     if(timeout)body.chatTimeoutSeconds=parseInt(timeout);
     await api('/api/admin/settings',{method:'PUT',body:JSON.stringify(body)});
     showNotice('设置已保存','success');
+  }catch(e){showNotice(e.message,'error');}
+}
+
+async function changeAdminPassword(){
+  const cur=$('cpCurrent').value, nw=$('cpNew').value, cf=$('cpConfirm').value;
+  if(!cur){showNotice('请输入当前密码','error');return;}
+  if(nw.length<6){showNotice('新密码长度至少为 6 个字符','error');return;}
+  if(nw!==cf){showNotice('两次输入的新密码不一致','error');return;}
+  try{
+    await api('/api/admin/change-password',{method:'POST',body:JSON.stringify({current_password:cur,new_password:nw})});
+    $('cpCurrent').value=$('cpNew').value=$('cpConfirm').value='';
+    showNotice('密码修改成功，请用新密码重新登录','success');
+    setTimeout(()=>location.replace('/login'),1500);
   }catch(e){showNotice(e.message,'error');}
 }
 
