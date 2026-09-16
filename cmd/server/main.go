@@ -32,11 +32,15 @@ func main() {
 	s.StartAutoCleanup()
 	s.StartConvCacheGC()
 	s.RefreshExpiredTokens()
-	listen := "127.0.0.1:4141"
+	// Default to all interfaces: the common deployment is behind a reverse
+	// proxy, container port mapping, or a tunnel, where binding loopback makes
+	// the service unreachable. Set M365_LISTEN to 127.0.0.1:4141 to restrict it
+	// to the local host.
+	listen := "0.0.0.0:4141"
 	if v := os.Getenv("M365_LISTEN"); v != "" {
 		listen = v
 	}
-	log.Printf("m365-copilot2api listening on http://%s\\n", listen)
+	log.Printf("m365-copilot2api listening on http://%s", listen)
 	server := &http.Server{
 		Addr:              listen,
 		Handler:           s.Routes(),
