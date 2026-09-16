@@ -1,7 +1,7 @@
 # M365 Copilot2API
 
 <p align="center">
-  <img src="https://img.shields.io/github/license/HEXUXIU/M365-Copilot2API" alt="License">
+  <img src="https://img.shields.io/github/license/bitscr/M365-Copilot2API" alt="License">
   <img src="https://img.shields.io/badge/Go-1.23%2B-00ADD8?logo=go" alt="Go Version">
   <img src="https://img.shields.io/badge/API-OpenAI%20Compatible-412991?logo=openai" alt="OpenAI Compatible">
   <img src="https://img.shields.io/badge/API-Anthropic%20Compatible-FF6B6B?logo=anthropic" alt="Anthropic Compatible">
@@ -93,51 +93,51 @@ M365 Copilot2API 是一个用 Go 编写的自托管网关，把微软 365 Copilo
 
 ```bash
 # x86_64
-curl -fL -o m365-copilot2api https://github.com/HEXUXIU/M365-Copilot2API/releases/latest/download/m365-copilot2api-linux-amd64 && chmod +x m365-copilot2api && ./m365-copilot2api
+curl -fL -o m365-copilot2api https://github.com/bitscr/M365-Copilot2API/releases/latest/download/m365-copilot2api-linux-amd64 && chmod +x m365-copilot2api && ./m365-copilot2api
 ```
 
 ```bash
 # arm64
-curl -fL -o m365-copilot2api https://github.com/HEXUXIU/M365-Copilot2API/releases/latest/download/m365-copilot2api-linux-arm64 && chmod +x m365-copilot2api && ./m365-copilot2api
+curl -fL -o m365-copilot2api https://github.com/bitscr/M365-Copilot2API/releases/latest/download/m365-copilot2api-linux-arm64 && chmod +x m365-copilot2api && ./m365-copilot2api
 ```
 
 ```bash
 # x86_32
-curl -fL -o m365-copilot2api https://github.com/HEXUXIU/M365-Copilot2API/releases/latest/download/m365-copilot2api-linux-386 && chmod +x m365-copilot2api && ./m365-copilot2api
+curl -fL -o m365-copilot2api https://github.com/bitscr/M365-Copilot2API/releases/latest/download/m365-copilot2api-linux-386 && chmod +x m365-copilot2api && ./m365-copilot2api
 ```
 
 ```bash
 # arm32
-curl -fL -o m365-copilot2api https://github.com/HEXUXIU/M365-Copilot2API/releases/latest/download/m365-copilot2api-linux-arm && chmod +x m365-copilot2api && ./m365-copilot2api
+curl -fL -o m365-copilot2api https://github.com/bitscr/M365-Copilot2API/releases/latest/download/m365-copilot2api-linux-arm && chmod +x m365-copilot2api && ./m365-copilot2api
 ```
 
 **macOS**
 
 ```bash
 # Apple Silicon (M 系列)
-curl -fL -o m365-copilot2api https://github.com/HEXUXIU/M365-Copilot2API/releases/latest/download/m365-copilot2api-darwin-arm64 && chmod +x m365-copilot2api && ./m365-copilot2api
+curl -fL -o m365-copilot2api https://github.com/bitscr/M365-Copilot2API/releases/latest/download/m365-copilot2api-darwin-arm64 && chmod +x m365-copilot2api && ./m365-copilot2api
 ```
 
 ```bash
 # Intel
-curl -fL -o m365-copilot2api https://github.com/HEXUXIU/M365-Copilot2API/releases/latest/download/m365-copilot2api-darwin-amd64 && chmod +x m365-copilot2api && ./m365-copilot2api
+curl -fL -o m365-copilot2api https://github.com/bitscr/M365-Copilot2API/releases/latest/download/m365-copilot2api-darwin-amd64 && chmod +x m365-copilot2api && ./m365-copilot2api
 ```
 
 **Windows** (PowerShell)
 
 ```powershell
 # x86_64
-irm -OutFile m365-copilot2api.exe https://github.com/HEXUXIU/M365-Copilot2API/releases/latest/download/m365-copilot2api-windows-amd64.exe; .\m365-copilot2api.exe
+irm -OutFile m365-copilot2api.exe https://github.com/bitscr/M365-Copilot2API/releases/latest/download/m365-copilot2api-windows-amd64.exe; .\m365-copilot2api.exe
 ```
 
 ```powershell
 # arm64
-irm -OutFile m365-copilot2api.exe https://github.com/HEXUXIU/M365-Copilot2API/releases/latest/download/m365-copilot2api-windows-arm64.exe; .\m365-copilot2api.exe
+irm -OutFile m365-copilot2api.exe https://github.com/bitscr/M365-Copilot2API/releases/latest/download/m365-copilot2api-windows-arm64.exe; .\m365-copilot2api.exe
 ```
 
 ```powershell
 # x86_32
-irm -OutFile m365-copilot2api.exe https://github.com/HEXUXIU/M365-Copilot2API/releases/latest/download/m365-copilot2api-windows-386.exe; .\m365-copilot2api.exe
+irm -OutFile m365-copilot2api.exe https://github.com/bitscr/M365-Copilot2API/releases/latest/download/m365-copilot2api-windows-386.exe; .\m365-copilot2api.exe
 ```
 
 > 首次运行 macOS 可能提示「无法验证开发者」：系统设置 → 隐私与安全性 → 仍要打开，或执行 `xattr -d com.apple.quarantine m365-copilot2api`。
@@ -212,7 +212,7 @@ launchctl load ~/Library/LaunchAgents/com.m365copilot2api.plist
 
 ### 预编译二进制（推荐）
 
-从 [GitHub Releases](https://github.com/HEXUXIU/M365-Copilot2API/releases) 下载对应平台的二进制：
+从 [GitHub Releases](https://github.com/bitscr/M365-Copilot2API/releases) 下载对应平台的二进制：
 
 | 平台 | 架构 | 文件 |
 |------|------|------|
@@ -220,12 +220,12 @@ launchctl load ~/Library/LaunchAgents/com.m365copilot2api.plist
 | Windows | x86_64 / arm64 / i386 / arm32 | `m365-copilot2api-windows-{amd64,arm64,386,arm}.exe` |
 | macOS | x86_64 / arm64 | `m365-copilot2api-darwin-{amd64,arm64}` |
 
-> 其余平台（FreeBSD、NetBSD、OpenBSD、Solaris/Illumos、AIX、Android、DragonFly BSD，及 MIPS/PPC/RISCV/S390x/LoongArch 等架构）同样提供预编译产物，见 [Releases](https://github.com/HEXUXIU/M365-Copilot2API/releases) 页面。
+> 其余平台（FreeBSD、NetBSD、OpenBSD、Solaris/Illumos、AIX、Android、DragonFly BSD，及 MIPS/PPC/RISCV/S390x/LoongArch 等架构）同样提供预编译产物，见 [Releases](https://github.com/bitscr/M365-Copilot2API/releases) 页面。
 
 ### 源码编译
 
 ```powershell
-git clone https://github.com/HEXUXIU/M365-Copilot2API.git
+git clone https://github.com/bitscr/M365-Copilot2API.git
 cd M365-Copilot2API
 
 # 设置管理员密码（可选，默认 admin123），生产环境务必设置强密码
