@@ -15,6 +15,7 @@ cookies*.txt
 /m365-copilot2api.exe.rollback
 /bin/
 /dist/
+/dist-*/
 *.out
 *.log
 # Python/runtime artifacts
