@@ -64,8 +64,17 @@ func parseContent(c any) (string, []chathub.Attachment) {
 			}
 		case "input_file", "file":
 			u := stringValue(m, "file_data", "file_url", "url", "source", "file_id")
-			if u != "" || stringValue(m, "filename", "name") != "" {
-				files = append(files, chathub.Attachment{Type: "file", URL: u, Name: stringValue(m, "filename", "name"), MimeType: stringValue(m, "mime_type", "mimeType", "content_type")})
+			name := stringValue(m, "filename", "name")
+			mime := stringValue(m, "mime_type", "mimeType", "content_type")
+			// Cherry Studio (via @ai-sdk/open-responses) sends file_data as a
+			// complete data URL and omits mime_type entirely, so the media type
+			// only exists in the URL prefix. Without lifting it out here the
+			// attachment reaches the uploader with an empty MimeType.
+			if mime == "" {
+				mime = mimeFromDataURL(u)
+			}
+			if u != "" || name != "" {
+				files = append(files, chathub.Attachment{Type: "file", URL: u, Name: name, MimeType: mime})
 			}
 		case "input_audio", "audio":
 			u := stringValue(m, "data", "audio_url", "url", "source")
@@ -84,4 +93,21 @@ func stringValue(m map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+// mimeFromDataURL returns the media type of a data: URL, or "" when the value
+// is not a data URL. Only the prefix is inspected; the payload is not decoded.
+func mimeFromDataURL(u string) string {
+	if !strings.HasPrefix(u, "data:") {
+		return ""
+	}
+	comma := strings.IndexByte(u, ',')
+	if comma < 0 {
+		return ""
+	}
+	semi := strings.IndexByte(u[:comma], ';')
+	if semi < 0 {
+		return ""
+	}
+	return strings.TrimSpace(u[len("data:"):semi])
 }

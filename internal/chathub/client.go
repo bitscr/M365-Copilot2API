@@ -1251,15 +1251,26 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 	imageCount := 0
 	for i := range attachments {
 		a := &attachments[i]
-		if a.Type != "image" {
+		if a.Type != "image" && a.Type != "file" {
 			continue
 		}
-		imageCount++
-		if imageCount > maxAttachments {
-			return fmt.Errorf("too many image attachments: limit is %d", maxAttachments)
+		// A file attachment with no payload (neither data URL nor remote URL)
+		// cannot be uploaded; skip it rather than failing the whole turn.
+		if a.URL == "" {
+			if c.Trace != nil {
+				c.Trace(map[string]any{"stage": "upload_skipped", "index": i, "type": a.Type, "name": a.Name, "reason": "no url"})
+			}
+			continue
+		}
+		isImage := a.Type == "image"
+		if isImage {
+			imageCount++
+			if imageCount > maxAttachments {
+				return fmt.Errorf("too many image attachments: limit is %d", maxAttachments)
+			}
 		}
 		// For non-data URLs, download the image first
-		imageData := a.URL
+		fileData := a.URL
 		if !strings.HasPrefix(a.URL, "data:") {
 			if err := validateRemoteDownloadURL(a.URL); err != nil {
 				return err
@@ -1284,30 +1295,44 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 			if mimeType == "" {
 				mimeType = "image/png"
 			}
-			imageData = "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(body)
+			fileData = "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(body)
 		}
-		comma := strings.IndexByte(imageData, ',')
+		comma := strings.IndexByte(fileData, ',')
 		if comma < 0 {
-			return fmt.Errorf("invalid image data URL")
+			return fmt.Errorf("attachment %d: invalid data URL", i)
 		}
-		encoded := imageData[comma+1:]
-		if !strings.Contains(strings.ToLower(imageData[:comma]), ";base64") {
-			return fmt.Errorf("image URL is not base64")
+		encoded := fileData[comma+1:]
+		if !strings.Contains(strings.ToLower(fileData[:comma]), ";base64") {
+			return fmt.Errorf("attachment %d: URL is not base64", i)
 		}
 		if _, err := base64.StdEncoding.DecodeString(encoded); err != nil {
-			return fmt.Errorf("decode image: %w", err)
+			return fmt.Errorf("attachment %d: decode payload: %w", i, err)
 		}
 		form := url.Values{}
-		form.Set("scenario", "UploadImage")
+		// The endpoint only accepts the UploadImage scenario; probing UploadFile
+		// returned HTTP 400 InvalidRequest. Documents go through the same one.
+		uploadScenario := "UploadImage"
+		form.Set("scenario", uploadScenario)
 		form.Set("conversationId", conversationID)
 		// The browser sends the complete data URL in FileBase64, including the
 		// media-type prefix. UploadFile accepts this form and returns docId.
 		// Live-verified 2026-08-08: UploadFile rejects multipart bodies
 		// (HTTP 400 InvalidRequest); it requires x-www-form-urlencoded like
 		// PyRIT's httpx client sends.
-		form.Set("FileBase64", imageData)
+		form.Set("FileBase64", fileData)
+		// The response echoes fileName/fileType, so the service parses them for
+		// non-image payloads; send them explicitly instead of relying on the
+		// data URI alone.
+		if !isImage {
+			if a.Name != "" {
+				form.Set("fileName", a.Name)
+			}
+			if ft := fileTypeFromMime(a.MimeType); ft != "" {
+				form.Set("fileType", ft)
+			}
+		}
 		if c.Trace != nil {
-			c.Trace(map[string]any{"stage": "upload_start", "index": i, "conversation_id": conversationID, "mime_type": a.MimeType, "base64_length": len(encoded), "token_present": acc.AccessToken != ""})
+			c.Trace(map[string]any{"stage": "upload_start", "index": i, "type": a.Type, "scenario": uploadScenario, "conversation_id": conversationID, "mime_type": a.MimeType, "name": a.Name, "base64_length": len(encoded), "token_present": acc.AccessToken != ""})
 		}
 		form.Add("optionsSets", "cwcgptvsan")
 		form.Add("optionsSets", "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch")
@@ -1380,6 +1405,22 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 	return nil
 }
 
+// unuploadedFileCount counts non-image attachments that carry no docId, meaning
+// ChatHub never accepted them and no messageAnnotation can reference them. Only
+// a count is returned: writing the bare filename into the prompt makes M365's
+// entity annotator tag it as <File>name</File> and the tag leaks into the
+// answer, which is worse than the model simply knowing a file was attached.
+func unuploadedFileCount(attachments []Attachment) int {
+	n := 0
+	for _, a := range attachments {
+		if a.Type != "file" || a.DocID != "" {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
 func chatPayload(req Request, requestID string, firstTurn bool) string {
 	_ = firstTurn
 	locale := req.Locale
@@ -1396,6 +1437,15 @@ func chatPayload(req Request, requestID string, firstTurn bool) string {
 		deviceOS = "Windows"
 	}
 	text := toolProtocolPrompt(req.Text, req.Tools, req.ToolChoice, len(clientPlugins(req.Tools, req.MCPServerURL)) > 0)
+	// ChatHub's UploadFile endpoint only accepts the UploadImage scenario, which
+	// rejects non-image payloads (probed: application/pdf -> InvalidFileDataUri,
+	// a faked image MIME -> InternalError). A document that failed to upload has
+	// no docId, so no messageAnnotation can reference it and the model would
+	// otherwise not even know it was attached. Name it in the text so the answer
+	// reflects that a file was provided.
+	if n := unuploadedFileCount(req.Attachments); n > 0 {
+		text += fmt.Sprintf("\n\n[%d attached document(s) are present but their contents are unavailable to you. Do not claim to have read them.]", n)
+	}
 	federatedConns := req.ConnectedFederatedIDs
 	if len(federatedConns) == 0 {
 		federatedConns = []string{"dummyId"}
@@ -1439,11 +1489,19 @@ func chatPayload(req Request, requestID string, firstTurn bool) string {
 	// sends a file annotation after the file has been uploaded by Office.
 	annotations := make([]any, 0, len(req.Attachments))
 	for _, a := range req.Attachments {
-		if a.Type != "image" || a.DocID == "" {
+		if a.DocID == "" {
+			continue
+		}
+		isImage := a.Type == "image"
+		if !isImage && a.Type != "file" {
 			continue
 		}
 		if a.Name == "" {
-			a.Name = "image." + a.FileType
+			if isImage {
+				a.Name = "image." + a.FileType
+			} else {
+				a.Name = "file." + a.FileType
+			}
 		}
 		fileType := a.FileType
 		if fileType == "" {
@@ -1452,13 +1510,19 @@ func chatPayload(req Request, requestID string, firstTurn bool) string {
 		if fileType == "" || fileType == "image" || fileType == "*" {
 			fileType = "jpg"
 		}
+		// Images are annotated as ImageFile; other documents use the plain File
+		// annotation the uploader reports a docId for.
+		annotationType := "File"
+		if isImage {
+			annotationType = "ImageFile"
+		}
 		annotations = append(annotations, map[string]any{
 			"id": a.DocID,
 			"messageAnnotationMetadata": map[string]any{
 				"@type": "File", "annotationType": "File",
 				"fileType": fileType, "fileName": a.Name,
 			},
-			"messageAnnotationType": "ImageFile",
+			"messageAnnotationType": annotationType,
 		})
 	}
 	if len(annotations) > 0 {
