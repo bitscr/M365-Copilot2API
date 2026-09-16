@@ -139,24 +139,12 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	var text strings.Builder
-	messageID := "msg_" + uuid.NewString()
-	textStarted := false
+	ts := newResponsesTextStream(ss)
 	type tcState struct {
 		ID, Name, Args, Type string
 		ItemID               string
 	}
 	calls := map[int]*tcState{}
-	// ensureTextItem emits the message item exactly once, immediately before the
-	// first text delta. Emitting it lazily is what keeps output_item.added ahead
-	// of every delta, as the spec requires.
-	ensureTextItem := func() {
-		if textStarted {
-			return
-		}
-		textStarted = true
-		_ = ss.emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": []any{outputTextBlock("txt_"+uuid.NewString(), "")}}})
-	}
 	scanner := bufio.NewScanner(pr)
 	scanner.Buffer(make([]byte, 4096), 2<<20)
 	for scanner.Scan() {
@@ -183,12 +171,9 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 			// as replacement characters (the reported mojibake for external
 			// clients). Only bytes actually emitted are accumulated so the
 			// terminal output_text.done matches the delta stream exactly.
-			ensureTextItem()
-			sent, err := ss.outputTextDelta(0, messageID, content)
-			if err != nil {
+			if err := ts.Append(content); err != nil {
 				return
 			}
-			text.WriteString(sent)
 		}
 		if rawCalls, ok := delta["tool_calls"].([]any); ok {
 			for _, raw := range rawCalls {
@@ -238,10 +223,8 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 
 	// Release any rune held back by the boundary repair before deciding whether
 	// the stream is empty.
-	if tail, err := ss.flushTextDelta(0, messageID); err != nil {
+	if err := ts.Flush(); err != nil {
 		return
-	} else if tail != "" {
-		text.WriteString(tail)
 	}
 
 	if scanner.Err() != nil || irw.status >= http.StatusBadRequest {
@@ -258,7 +241,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		})
 		return
 	}
-	if len(calls) == 0 && strings.TrimSpace(text.String()) == "" {
+	if len(calls) == 0 && strings.TrimSpace(ts.Text()) == "" {
 		// Never leave a Responses stream after response.created without a
 		// terminal event: clients otherwise render this as a successful blank
 		// answer and may reuse an incomplete response on the next turn.
@@ -298,20 +281,12 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 			_ = ss.emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
 		}
 	} else {
-		finalText := text.String()
-		if !textStarted {
-			// Nothing was streamed yet (a very short answer can arrive in one
-			// frame that the boundary buffer held): emit the item and the whole
-			// body as one delta so the client still gets the text.
-			_ = ss.emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": []any{outputTextBlock("txt_"+uuid.NewString(), "")}}})
-			_ = ss.emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": messageID, "delta": finalText})
-		}
-		item := map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "completed", "content": []any{outputTextBlock("txt_"+uuid.NewString(), finalText)}}
-		output = append(output, item)
-		_ = ss.emit("response.output_text.done", map[string]any{"type": "response.output_text.done", "output_index": 0, "content_index": 0, "item_id": messageID, "text": finalText})
-		_ = ss.emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": item})
+		// Finish closes the text item: it emits output_text.done and
+		// output_item.done from the same accumulated text the deltas carried.
+		// Restating the body here is what duplicated answers for clients before.
+		output = append(output, ts.Finish())
 	}
-	usageOutput := text.String()
+	usageOutput := ts.Text()
 	for _, call := range calls {
 		usageOutput += call.Name + call.Args
 	}

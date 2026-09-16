@@ -175,6 +175,98 @@ func (s *responsesSSEStream) flushTextDelta(outputIndex int, itemID string) (str
 	return tail, err
 }
 
+// responsesTextStream owns the single text item of a Responses stream. It is a
+// type rather than a few locals in the handler because the invariant that broke
+// before -- the same text reaching the client twice, once from the delta loop
+// and again from an end-of-stream fallback -- was invisible and untestable while
+// it lived inline across two branches.
+type responsesTextStream struct {
+	ss        *responsesSSEStream
+	messageID string
+	contentID string
+	started   bool
+	text      strings.Builder
+}
+
+func newResponsesTextStream(ss *responsesSSEStream) *responsesTextStream {
+	return &responsesTextStream{
+		ss:        ss,
+		messageID: "msg_" + uuid.NewString(),
+		contentID: "txt_" + uuid.NewString(),
+	}
+}
+
+// Started reports whether the message item has been emitted.
+func (t *responsesTextStream) Started() bool { return t.started }
+
+// ensureItem emits the message item exactly once, immediately before the first
+// delta, so output_item.added always precedes the text it describes.
+func (t *responsesTextStream) ensureItem() {
+	if t.started {
+		return
+	}
+	t.started = true
+	_ = t.ss.emit("response.output_item.added", map[string]any{
+		"type": "response.output_item.added", "output_index": 0,
+		"item": map[string]any{"type": "message", "id": t.messageID, "role": "assistant", "status": "in_progress", "content": []any{outputTextBlock(t.contentID, "")}},
+	})
+}
+
+// Append feeds one upstream content chunk through UTF-8 boundary repair and
+// accumulates exactly what reached the wire. Nothing is buffered for a later
+// resend: the only text the client ever sees comes from here or from Flush.
+func (t *responsesTextStream) Append(chunk string) error {
+	if chunk == "" {
+		return nil
+	}
+	t.ensureItem()
+	sent, err := t.ss.outputTextDelta(0, t.messageID, chunk)
+	if err != nil {
+		return err
+	}
+	t.text.WriteString(sent)
+	return nil
+}
+
+// Flush releases a rune held back by boundary repair at end of stream.
+func (t *responsesTextStream) Flush() error {
+	tail, err := t.ss.flushTextDelta(0, t.messageID)
+	if err != nil {
+		return err
+	}
+	t.text.WriteString(tail)
+	return nil
+}
+
+// Finish closes the text item: it releases any held rune, then emits
+// output_text.done and output_item.done. Keeping the terminal events in the same
+// type as the deltas is what makes "the done text equals the concatenated
+// deltas" true by construction rather than by two branches agreeing.
+func (t *responsesTextStream) Finish() map[string]any {
+	_ = t.Flush()
+	text := t.text.String()
+	_ = t.ss.emit("response.output_text.done", map[string]any{
+		"type": "response.output_text.done", "output_index": 0, "content_index": 0,
+		"item_id": t.messageID, "text": text,
+	})
+	item := t.Item()
+	_ = t.ss.emit("response.output_item.done", map[string]any{
+		"type": "response.output_item.done", "output_index": 0, "item": item,
+	})
+	return item
+}
+
+// Text is the accumulated wire text; it equals the concatenated deltas.
+func (t *responsesTextStream) Text() string { return t.text.String() }
+
+// Item is the completed message item for the output array.
+func (t *responsesTextStream) Item() map[string]any {
+	return map[string]any{
+		"type": "message", "id": t.messageID, "role": "assistant", "status": "completed",
+		"content": []any{outputTextBlock(t.contentID, t.text.String())},
+	}
+}
+
 // outputTextBlock builds an output_text content part. logprobs is part of the
 // required schema (not optional), and omitting it is what makes openai-python
 // raise a validation error when parsing the item.
