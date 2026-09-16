@@ -63,6 +63,36 @@ func TestResponsesToolSSEDoesNotDuplicateArguments(t *testing.T) {
 	}
 }
 
+func TestResponsesTextSSEPreservesMarkdownAndIncrementalDeltas(t *testing.T) {
+	want := "建议执行：\n\n```powershell\npy -m pip install PyMuPDF `\n  --index-url https://pypi.org/simple `\n  --no-proxy-env `\n  --timeout 60\n```\n"
+	source := map[string]any{"choices": []any{map[string]any{"finish_reason": "stop", "message": map[string]any{"role": "assistant", "content": want}}}}
+	rr := httptest.NewRecorder()
+	writeResponsesResult(rr, "m", true, source)
+
+	var accumulated, done string
+	for _, line := range strings.Split(rr.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
+			t.Fatal(err)
+		}
+		switch event["type"] {
+		case "response.output_text.delta":
+			accumulated += event["delta"].(string)
+		case "response.output_text.done":
+			done = event["text"].(string)
+		}
+	}
+	if accumulated != want {
+		t.Fatalf("delta text changed or duplicated:\nwant %q\n got %q", want, accumulated)
+	}
+	if done != want {
+		t.Fatalf("done text differs from deltas:\nwant %q\n got %q", want, done)
+	}
+}
+
 func TestAnthropicToolSSEEvents(t *testing.T) {
 	rr := httptest.NewRecorder()
 	writeAnthropicResult(rr, "m", true, toolSource())
