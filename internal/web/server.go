@@ -623,11 +623,14 @@ func (s *Server) adminKeys(w http.ResponseWriter, r *http.Request) {
 }
 
 // apiKeyHeaderNames are the header names a client may use to present the
-// gateway API key. Codex CLI and CC Switch send "api-key" (an OpenAI SDK
-// legacy header), the OpenAI JS/Python SDKs send "Authorization: Bearer",
-// and the web console sends "X-API-Key". All must be accepted or agent
-// clients fail with 401 even though the key is valid.
-var apiKeyHeaderNames = []string{"X-API-Key", "api-key", "Api-Key", "x-api-key"}
+// gateway API key. Codex CLI and CC Switch send "api-key"; some Codex builds
+// and OpenAI-compatible clients send "openai-api-key"; the OpenAI SDKs send
+// "Authorization: Bearer"; the web console sends "X-API-Key". All must be
+// accepted or agent clients fail with 401 even though the key is valid.
+var apiKeyHeaderNames = []string{
+	"X-API-Key", "api-key", "Api-Key", "x-api-key",
+	"openai-api-key", "OpenAI-Api-Key", "openai-organization-api-key",
+}
 
 func presentedAPIKey(r *http.Request) (string, bool) {
 	for _, name := range apiKeyHeaderNames {

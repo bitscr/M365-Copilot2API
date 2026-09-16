@@ -19,6 +19,8 @@ func TestPresentedAPIKeyAcceptsAgentHeaderForms(t *testing.T) {
 		wantOK  bool
 	}{
 		{"api-key (Codex CLI, CC Switch)", map[string]string{"api-key": key}, key, true},
+		{"openai-api-key (some Codex builds)", map[string]string{"openai-api-key": key}, key, true},
+		{"OpenAI-Api-Key (canonical casing)", map[string]string{"OpenAI-Api-Key": key}, key, true},
 		{"Api-Key (canonical MIME form)", map[string]string{"Api-Key": key}, key, true},
 		{"X-API-Key (web console)", map[string]string{"X-API-Key": key}, key, true},
 		{"Authorization Bearer (OpenAI SDK)", map[string]string{"Authorization": "Bearer " + key}, key, true},
