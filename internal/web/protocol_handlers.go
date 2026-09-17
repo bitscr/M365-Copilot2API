@@ -147,12 +147,17 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	calls := map[int]*tcState{}
 	scanner := bufio.NewScanner(pr)
 	scanner.Buffer(make([]byte, 4096), 2<<20)
+	sawDone := false
 	for scanner.Scan() {
 		if r.Context().Err() != nil {
 			return
 		}
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
+		if line == "data: [DONE]" {
+			sawDone = true
+			break
+		}
+		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
 		var chunk map[string]any
@@ -227,16 +232,22 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	if scanner.Err() != nil || irw.status >= http.StatusBadRequest {
+	if scanner.Err() != nil || irw.status >= http.StatusBadRequest || !sawDone {
 		status := irw.status
-		if status == 0 {
+		code := fmt.Sprint(status)
+		message := "inner chat request failed"
+		if !sawDone && scanner.Err() == nil && irw.status < http.StatusBadRequest {
+			code = "missing_done_event"
+			message = "inner chat stream ended without a [DONE] event"
+		} else if status == 0 {
 			status = http.StatusBadGateway
+			code = fmt.Sprint(status)
 		}
 		_ = ss.emit("response.failed", map[string]any{
 			"type": "response.failed",
 			"response": map[string]any{
 				"id": id, "object": "response", "status": "failed", "model": model,
-				"error": responsesError(fmt.Sprint(status), "inner chat request failed"),
+				"error": responsesError(code, message),
 			},
 		})
 		return
