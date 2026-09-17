@@ -40,7 +40,9 @@ var publicProviderIdentityPattern = regexp.MustCompile(`(?i)` + publicProviderId
 var publicProviderSelfDescriptionPattern = regexp.MustCompile(`(?is)^\s*(?:you\s+are|this\s+is|the\s+(?:assistant|model)\s+is|` + publicProviderIdentityExpression + `\s*[,，:：-]).*(?:based\s+on|conversational\s+ai|ai\s+model|assistant|基于|对话式|模型)`)
 var publicLocalizedSelfIdentityPattern = regexp.MustCompile(`(?is)(?:私は|わたしは|저는|나는|soy|je\s+suis|ich\s+bin|sou|sono|я|أنا|ben|ik\s+ben|jestem|मैं|ฉัน|tôi\s+là)\s*(?:an?\s+|un(?:e)?\s+|ein(?:e)?\s+|uma?\s+|một\s+)?` + publicProviderIdentityExpression + `\b`)
 var publicReasoningLeakPattern = regexp.MustCompile(`(?is)(?:\byou\s+are\s+(?:an?\s+)?` + publicProviderIdentityExpression + `\b|\b(?:system|developer)\s+prompt\b|prompt\s+confidentiality|hidden\s+(?:instruction|prompt)|tool\s+protocol|(?:系统|开发者)提示(?:词)?|提示词保密|工具协议|` + publicProviderIdentityExpression + `\s+.*(?:based\s+on|conversational\s+ai|ai\s+model))`)
-var publicInternalCitationPattern = regexp.MustCompile(`(?i)(?:<cite>\s*turn\d+(?:search|news|image)\d+(?:\s*[,;]?\s*turn\d+(?:search|news|image)\d+)*\s*</cite>|cite(?:turn\d+(?:search|news|image)\d+)+)`)
+var publicInternalCitationPattern = regexp.MustCompile(`(?i)(?:<cite>\s*(?:turn\d+(?:search|news|image)\d+|call_[a-z0-9_-]+)(?:\s*[,;]?\s*(?:turn\d+(?:search|news|image)\d+|call_[a-z0-9_-]+))*\s*</cite>|cite(?:(?:turn\d+(?:search|news|image)\d+|call_[a-z0-9_-]+))*)`)
+
+var publicInternalFilePattern = regexp.MustCompile(`(?i)</?\s*File\s*>`)
 
 var publicSelfIdentityPattern = regexp.MustCompile(`(?i)(?:` +
 	`\b(?:i(?:\s+am|['’]m)|my\s+(?:name|identity)\s+is|this\s+(?:assistant|model)\s+is)` +
@@ -213,6 +215,8 @@ func sanitizePublicAssistantText(text string) string {
 }
 
 func sanitizePublicAssistantTextForModel(text, model string) string {
+	text = publicInternalCitationPattern.ReplaceAllString(text, "")
+	text = publicInternalFilePattern.ReplaceAllString(text, "")
 	if !publicIdentityPolicyEnabled() {
 		return text
 	}

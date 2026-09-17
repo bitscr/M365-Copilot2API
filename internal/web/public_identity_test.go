@@ -5,6 +5,7 @@ import (
 	"m365-copilot2api/internal/chathub"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -175,13 +176,31 @@ func TestPublicReasoningStreamFilterBlocksSplitLeak(t *testing.T) {
 }
 
 func TestSanitizePublicAssistantTextRemovesInternalCitationMarkers(t *testing.T) {
-	input := "答案是 42。<cite>turn4search6</cite> 更多内容。citeturn1search2turn1search3"
+	input := "答案是 42。<cite>turn4search6</cite> 更多内容。citecall_test123，文件 report.pdf。"
 	got := sanitizePublicAssistantText(input)
-	if strings.Contains(got, "<cite>") || strings.Contains(got, "turn4search6") || strings.Contains(got, "cite") {
-		t.Fatalf("internal citation marker leaked: %q", got)
+	for _, forbidden := range []string{"<cite>", "turn4search6", "cite", "call_test123"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("internal citation marker %q leaked: %q", forbidden, got)
+		}
 	}
-	if !strings.Contains(got, "答案是 42") || !strings.Contains(got, "更多内容") {
+	if !strings.Contains(got, "答案是 42") || !strings.Contains(got, "更多内容") || !strings.Contains(got, "report.pdf") {
 		t.Fatalf("visible answer was damaged: %q", got)
+	}
+}
+
+func TestSanitizePublicAssistantTextRemovesInternalFileTags(t *testing.T) {
+	input := "我没收到 <File>Report.pdf</File> 这个文件，请重新上传 report.pdf。"
+	for _, enabled := range []bool{true, false} {
+		t.Setenv("M365_PUBLIC_IDENTITY_POLICY", strconv.FormatBool(enabled))
+		got := sanitizePublicAssistantText(input)
+		for _, forbidden := range []string{"<File>", "</File>", "<file>", "</file>"} {
+			if strings.Contains(got, forbidden) {
+				t.Fatalf("internal file tag %q leaked (policy=%t): %q", forbidden, enabled, got)
+			}
+		}
+		if !strings.Contains(got, "Report.pdf") || !strings.Contains(got, "重新上传") {
+			t.Fatalf("visible answer was damaged (policy=%t): %q", enabled, got)
+		}
 	}
 }
 
@@ -195,6 +214,20 @@ func TestToolResponsesSanitizeReasoningIdentity(t *testing.T) {
 		if strings.Contains(strings.ToLower(rr.Body.String()), "copilot") {
 			t.Fatalf("tool response leaked provider identity: %s", rr.Body.String())
 		}
+	}
+}
+
+func TestSanitizePublicAssistantTextAlwaysRemovesInternalMarkers(t *testing.T) {
+	t.Setenv("M365_PUBLIC_IDENTITY_POLICY", "false")
+	input := "结果 citecall_test123，文件 result.txt。"
+	got := sanitizePublicAssistantText(input)
+	for _, forbidden := range []string{"cite", "call_test123"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("internal marker %q leaked while identity policy was disabled: %q", forbidden, got)
+		}
+	}
+	if !strings.Contains(got, "结果") || !strings.Contains(got, "result.txt") {
+		t.Fatalf("ordinary content was removed: %q", got)
 	}
 }
 
