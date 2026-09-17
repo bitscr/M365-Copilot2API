@@ -49,14 +49,26 @@ func TestPublicIdentityPolicyCanBeDisabledForRawUpstreamResponses(t *testing.T) 
 		t.Fatalf("reasoning text was sanitized while disabled: %q", got)
 	}
 	// The policy gate governs identity text only. Protocol internals (citation
-	// anchors, <File> tags) are scrubbed unconditionally, so this fragment must
-	// carry no internal markers for the assertion to be about the gate itself.
+	// anchors, <File> tags) are scrubbed unconditionally. The filter now holds
+	// back a trailing window so a marker split across fragments is still caught,
+	// so identity text is observed through Push+Flush rather than one Push.
+	fragFilter := &publicIdentityStreamFilter{}
 	fragment := "我是 M365 Copilot，基于 GPT-5 推理模型。"
-	if got := (&publicIdentityStreamFilter{}).Push(fragment); got != fragment {
+	if got := fragFilter.Push(fragment) + fragFilter.Flush(); got != fragment {
 		t.Fatalf("stream fragment was changed while disabled: %q", got)
 	}
-	if got := (&publicIdentityStreamFilter{}).Push("<cite>turn4search6</cite>"); got != "" {
+	markerFilter := &publicIdentityStreamFilter{}
+	if got := markerFilter.Push("<cite>turn4search6</cite>") + markerFilter.Flush(); got != "" {
 		t.Fatalf("internal citation marker survived while disabled: %q", got)
+	}
+	// A tag split across fragments must still be removed.
+	splitFilter := &publicIdentityStreamFilter{}
+	got := splitFilter.Push("我没收到 <Orga") + splitFilter.Push("nization>国家市场监督管理总局") + splitFilter.Push("</Organi") + splitFilter.Push("zation> 的说明。") + splitFilter.Flush()
+	if strings.Contains(got, "<") || strings.Contains(got, ">") {
+		t.Fatalf("split entity tag survived while disabled: %q", got)
+	}
+	if !strings.Contains(got, "国家市场监督管理总局") || !strings.Contains(got, "的说明") {
+		t.Fatalf("split-fragment content was damaged: %q", got)
 	}
 }
 
@@ -191,6 +203,22 @@ func TestSanitizePublicAssistantTextRemovesInternalCitationMarkers(t *testing.T)
 	}
 	if !strings.Contains(got, "答案是 42") || !strings.Contains(got, "更多内容") || !strings.Contains(got, "report.pdf") {
 		t.Fatalf("visible answer was damaged: %q", got)
+	}
+}
+
+func TestSanitizePublicAssistantTextRemovesEntityTagsAndCitationAnchors(t *testing.T) {
+	input := "9月17日，<Organization>国家市场监督管理总局</Organization>发布了清单【1-298683】，涉及<Person>张三</Person>和海南省昌江县【6-67cc80】。"
+	for _, enabled := range []bool{true, false} {
+		t.Setenv("M365_PUBLIC_IDENTITY_POLICY", strconv.FormatBool(enabled))
+		got := sanitizePublicAssistantText(input)
+		for _, forbidden := range []string{"<Organization>", "</Organization>", "<Person>", "</Person>", "【1-298683】", "【6-67cc80】"} {
+			if strings.Contains(got, forbidden) {
+				t.Fatalf("internal marker %q leaked (policy=%t): %q", forbidden, enabled, got)
+			}
+		}
+		if !strings.Contains(got, "国家市场监督管理总局") || !strings.Contains(got, "张三") || !strings.Contains(got, "昌江县") {
+			t.Fatalf("entity name was removed with its tag (policy=%t): %q", enabled, got)
+		}
 	}
 }
 

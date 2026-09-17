@@ -44,6 +44,20 @@ var publicInternalCitationPattern = regexp.MustCompile(`(?i)(?:<cite>\s*(?:turn\
 
 var publicInternalFilePattern = regexp.MustCompile(`(?i)</?\s*File\s*>`)
 
+// publicInternalEntityPattern matches the entity tags M365's annotator injects
+// around recognised proper nouns (</?Organization>, </?Person>, </?Location>,
+// ...). They are prompt-engineering scaffolding, not user-visible prose.
+//
+// publicInternalAnchorPattern matches the 【<ref>-<hex>】 citation anchors that
+// survive StripCitationMarkers when the reference id is not present in the
+// response's References map; the unresolvable anchor then leaks verbatim.
+var (
+	// Entity tags are PascalCase proper-noun markers; matching the shape rather
+	// than an enumerated list means a tag M365 adds later is still removed.
+	publicInternalEntityPattern = regexp.MustCompile(`</?[A-Z][A-Za-z0-9]{0,31}>`)
+	publicInternalAnchorPattern = regexp.MustCompile(`\x{3010}[0-9]+-[0-9a-fA-F]{4,}\x{3011}`)
+)
+
 var publicSelfIdentityPattern = regexp.MustCompile(`(?i)(?:` +
 	`\b(?:i(?:\s+am|['’]m)|my\s+(?:name|identity)\s+is|this\s+(?:assistant|model)\s+is)` +
 	`\s+(?:not\s+)?(?:(?:an?|the|your)\s+)?` + publicProviderIdentityExpression +
@@ -215,12 +229,14 @@ func sanitizePublicAssistantText(text string) string {
 }
 
 // scrubPublicInternalMarkers removes protocol-internal markers (citation
-// anchors and M365's <File> entity tags) unconditionally. They are wire
+// anchors, entity tags and M365's <File> tags) unconditionally. They are wire
 // internals, not identity text, so they must never reach a client even when
 // the identity policy is disabled.
 func scrubPublicInternalMarkers(text string) string {
 	text = publicInternalCitationPattern.ReplaceAllString(text, "")
-	return publicInternalFilePattern.ReplaceAllString(text, "")
+	text = publicInternalFilePattern.ReplaceAllString(text, "")
+	text = publicInternalEntityPattern.ReplaceAllString(text, "")
+	return publicInternalAnchorPattern.ReplaceAllString(text, "")
 }
 
 func sanitizePublicAssistantTextForModel(text, model string) string {
@@ -412,19 +428,46 @@ func newPublicIdentityStreamFilter(models ...string) *publicIdentityStreamFilter
 	return &publicIdentityStreamFilter{model: model}
 }
 
+// publicIdentityStreamHoldback is the number of trailing bytes held back in the
+// policy-off fast path. Internal markers and entity tags can be split across SSE
+// fragments, so scrubbing each fragment in isolation misses a tag whose '<' and
+// '>' land in different fragments. Holding back a small tail and re-scrubbing
+// the concatenation closes that boundary.
+const publicIdentityStreamHoldback = 64
+
 func (f *publicIdentityStreamFilter) Push(fragment string) string {
 	if f == nil {
 		return sanitizePublicAssistantText(fragment)
 	}
-	// Internal markers are scrubbed before the policy gate, so a fragment that
-	// carries no identity text still gets its citation anchors and <File> tags
-	// removed. Without this the policy-off path returned the fragment verbatim
-	// and the tags reached the client.
-	fragment = scrubPublicInternalMarkers(fragment)
-	if !publicIdentityPolicyEnabled() {
-		return fragment
-	}
 	f.pending += fragment
+	// Markers are scrubbed before the policy gate so a fragment carrying no
+	// identity text still gets its citation anchors, entity tags and <File> tags
+	// removed.
+	if !publicIdentityPolicyEnabled() {
+		if len(f.pending) <= publicIdentityStreamHoldback {
+			return ""
+		}
+		cut := len(f.pending) - publicIdentityStreamHoldback
+		for cut > 0 && !utf8.RuneStart(f.pending[cut]) {
+			cut--
+		}
+		// Never cut inside an unterminated '<...' tag or a … citation
+		// run: a marker split across fragments would otherwise be released in
+		// pieces and no regex could match it. Pull the cut back to the last
+		// unmatched opener.
+		if open := strings.LastIndexByte(f.pending[:cut], '<'); open >= 0 && !strings.ContainsRune(f.pending[open:cut], '>') {
+			cut = open
+		}
+		if open := strings.LastIndex(f.pending[:cut], "\ue200"); open >= 0 && !strings.ContainsRune(f.pending[open:cut], '\ue201') {
+			cut = open
+		}
+		if cut <= 0 {
+			return ""
+		}
+		out := scrubPublicInternalMarkers(f.pending[:cut])
+		f.pending = f.pending[cut:]
+		return out
+	}
 	return f.consume(false)
 }
 
