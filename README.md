@@ -11,6 +11,19 @@
   <strong>Microsoft 365 Copilot → OpenAI / Anthropic 兼容 API 网关</strong>
 </p>
 
+> ## 📌 关于本仓库
+>
+> 这是 **bitscr 维护的修改版（fork）**，不是上游原项目。本仓库的 `main` 分支以**本仓库的修改为准**：所有构建、Release 二进制与部署都只从 `github.com/bitscr/M365-Copilot2API` 产出，不会回退到原项目代码。
+>
+> - **安装与部署一律使用本仓库**：
+>   ```bash
+>   git clone https://github.com/bitscr/M365-Copilot2API.git
+>   ```
+>   或从 [本仓库 Releases](https://github.com/bitscr/M365-Copilot2API/releases) 下载二进制。
+> - 本仓库**只配置了 `origin` 一个远端**，指向 `bitscr/M365-Copilot2API`；不存在指向其他仓库的 `upstream` 远端，因此 `git push` 与 GitHub Actions 构建都不会触及原项目。
+> - 本仓库相对上游的改动（含内部标记清理、流式协议修复等）记录在 [commit 历史](https://github.com/bitscr/M365-Copilot2API/commits/main) 中。
+> - 上游原项目的代码与文档若与本仓库冲突，**以本仓库为准**。
+
 M365 Copilot2API 是一个用 Go 编写的自托管网关，把微软 365 Copilot 商业订阅背后的 **ChatHub 私有协议**（WebSocket）翻译成标准的 **OpenAI / Anthropic 兼容 API**。Claude Code、OpenCode、Cursor 以及任何 OpenAI 客户端都可以直接用熟悉的格式调用 M365 Copilot。
 
 工作原理概括：**ChatHub 私有协议 ⇄ OpenAI / Anthropic 兼容 API**。连接握手、心跳保活、事件流解析、工具调用转换全部封装在 `internal/chathub` 层，对外只暴露 `/v1/chat/completions`、`/v1/messages` 等标准端点。
