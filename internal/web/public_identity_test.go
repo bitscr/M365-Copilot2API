@@ -48,9 +48,15 @@ func TestPublicIdentityPolicyCanBeDisabledForRawUpstreamResponses(t *testing.T) 
 	if got := sanitizePublicReasoningText("You are Microsoft Copilot."); got != "You are Microsoft Copilot." {
 		t.Fatalf("reasoning text was sanitized while disabled: %q", got)
 	}
-	fragment := "<cite>turn4search6</cite>"
+	// The policy gate governs identity text only. Protocol internals (citation
+	// anchors, <File> tags) are scrubbed unconditionally, so this fragment must
+	// carry no internal markers for the assertion to be about the gate itself.
+	fragment := "我是 M365 Copilot，基于 GPT-5 推理模型。"
 	if got := (&publicIdentityStreamFilter{}).Push(fragment); got != fragment {
 		t.Fatalf("stream fragment was changed while disabled: %q", got)
+	}
+	if got := (&publicIdentityStreamFilter{}).Push("<cite>turn4search6</cite>"); got != "" {
+		t.Fatalf("internal citation marker survived while disabled: %q", got)
 	}
 }
 
@@ -185,6 +191,26 @@ func TestSanitizePublicAssistantTextRemovesInternalCitationMarkers(t *testing.T)
 	}
 	if !strings.Contains(got, "答案是 42") || !strings.Contains(got, "更多内容") || !strings.Contains(got, "report.pdf") {
 		t.Fatalf("visible answer was damaged: %q", got)
+	}
+}
+
+func TestPublicIdentityStreamFilterScrubsInternalMarkersWhenPolicyDisabled(t *testing.T) {
+	t.Setenv("M365_PUBLIC_IDENTITY_POLICY", "false")
+	filter := newPublicIdentityStreamFilter()
+	chunks := []string{"我没收到 ", "<File>Report.pdf</File>", " 这个文件，", "请重新上传 \ue200cite\ue202call_test123\ue201"}
+	var got strings.Builder
+	for _, chunk := range chunks {
+		got.WriteString(filter.Push(chunk))
+	}
+	got.WriteString(filter.Flush())
+	out := got.String()
+	for _, forbidden := range []string{"<File>", "</File>", "\ue200cite", "call_test123"} {
+		if strings.Contains(out, forbidden) {
+			t.Fatalf("stream leaked internal marker %q: %q", forbidden, out)
+		}
+	}
+	if !strings.Contains(out, "Report.pdf") || !strings.Contains(out, "重新上传") {
+		t.Fatalf("visible stream content was damaged: %q", out)
 	}
 }
 

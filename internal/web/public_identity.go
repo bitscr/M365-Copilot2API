@@ -214,9 +214,17 @@ func sanitizePublicAssistantText(text string) string {
 	return sanitizePublicAssistantTextForModel(text, "")
 }
 
-func sanitizePublicAssistantTextForModel(text, model string) string {
+// scrubPublicInternalMarkers removes protocol-internal markers (citation
+// anchors and M365's <File> entity tags) unconditionally. They are wire
+// internals, not identity text, so they must never reach a client even when
+// the identity policy is disabled.
+func scrubPublicInternalMarkers(text string) string {
 	text = publicInternalCitationPattern.ReplaceAllString(text, "")
-	text = publicInternalFilePattern.ReplaceAllString(text, "")
+	return publicInternalFilePattern.ReplaceAllString(text, "")
+}
+
+func sanitizePublicAssistantTextForModel(text, model string) string {
+	text = scrubPublicInternalMarkers(text)
 	if !publicIdentityPolicyEnabled() {
 		return text
 	}
@@ -408,6 +416,11 @@ func (f *publicIdentityStreamFilter) Push(fragment string) string {
 	if f == nil {
 		return sanitizePublicAssistantText(fragment)
 	}
+	// Internal markers are scrubbed before the policy gate, so a fragment that
+	// carries no identity text still gets its citation anchors and <File> tags
+	// removed. Without this the policy-off path returned the fragment verbatim
+	// and the tags reached the client.
+	fragment = scrubPublicInternalMarkers(fragment)
 	if !publicIdentityPolicyEnabled() {
 		return fragment
 	}
@@ -420,7 +433,7 @@ func (f *publicIdentityStreamFilter) Flush() string {
 		return ""
 	}
 	if !publicIdentityPolicyEnabled() {
-		out := f.pending
+		out := scrubPublicInternalMarkers(f.pending)
 		f.pending = ""
 		return out
 	}
