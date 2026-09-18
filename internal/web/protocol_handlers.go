@@ -154,8 +154,14 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		}
 		line := scanner.Text()
 		if line == "data: [DONE]" {
+			// Record the terminal marker but keep draining the pipe: the inner
+			// openaiChat keeps writing after [DONE] (the ": m365-metrics" trace
+			// frame) and io.Pipe is synchronous, so stopping the reader here
+			// wedges the inner goroutine, which never closes the pipe and never
+			// closes innerDone -- the outer handler then blocks forever and the
+			// client sees "stream disconnected before completion".
 			sawDone = true
-			break
+			continue
 		}
 		if !strings.HasPrefix(line, "data: ") {
 			continue
@@ -224,7 +230,17 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 			}
 		}
 	}
-	<-innerDone
+	// Drain anything left in the pipe so the inner writer never blocks on a
+	// synchronous io.Pipe write (it writes the ": m365-metrics" trace after
+	// [DONE]); a blocked inner writer would never close the pipe nor innerDone.
+	_, _ = io.Copy(io.Discard, pr)
+	// Bound the wait: even if the inner goroutine is wedged, fail the response
+	// instead of hanging the client's connection indefinitely.
+	select {
+	case <-innerDone:
+	case <-time.After(5 * time.Second):
+		log.Printf("[responses] inner chat goroutine did not finish in time; proceeding")
+	}
 
 	// Release any rune held back by the boundary repair before deciding whether
 	// the stream is empty.
