@@ -357,7 +357,8 @@ python manage.py stop     # 停止服务
 | 变量 | 说明 |
 |------|------|
 | `M365_TOKEN_CACHE` | Token 缓存文件（未设置时落到数据目录） |
-| `M365_SESSION_CACHE` | 会话绑定缓存文件（默认 `sessions.json`） |
+| `M365_SESSION_CACHE` | 会话绑定缓存文件（默认 `sessions.json`；**仅**由会话解析器使用） |
+| `M365_ACTIVE_SESSION_CACHE` | 活跃会话索引（`sessionKey` → 对话，默认与 `sessions.json` 同目录的 `active-sessions.json`） |
 | `M365_CONVERSATION_CACHE` | 本地对话索引（默认 `conversations.json`） |
 | `M365_API_KEYS` | API Key 存储文件 |
 | `M365_USAGE_LOG` | 用量统计日志（默认 `{data_dir}/usage.jsonl`） |

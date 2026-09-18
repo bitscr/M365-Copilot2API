@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,11 +29,29 @@ type sessionStore struct {
 	persist *persistStore
 }
 
-func openSessionStore() *sessionStore {
-	path := os.Getenv("M365_SESSION_CACHE")
-	if path == "" {
-		path = filepath.Join(os.TempDir(), "m365-copilot2api-sessions.json")
+// activeSessionCachePath resolves the file that backs sessionStore (the
+// sessionKey -> conversation index served by /api/conversations).
+//
+// It must NOT default to M365_SESSION_CACHE: that path belongs to the
+// sessionResolver (its bindings are the array-format sessions.json documented
+// in the README). Sharing one file made the two stores clobber each other on
+// every flush — the resolver writes a JSON array, sessionStore writes a JSON
+// object — so sessionStore always failed to load and could corrupt the
+// resolver's bindings. A dedicated variable keeps them apart; when only
+// M365_SESSION_CACHE is configured we derive a sibling file so both live in the
+// same data directory.
+func activeSessionCachePath() string {
+	if p := strings.TrimSpace(os.Getenv("M365_ACTIVE_SESSION_CACHE")); p != "" {
+		return p
 	}
+	if p := strings.TrimSpace(os.Getenv("M365_SESSION_CACHE")); p != "" {
+		return filepath.Join(filepath.Dir(p), "active-sessions.json")
+	}
+	return "active-sessions.json"
+}
+
+func openSessionStore() *sessionStore {
+	path := activeSessionCachePath()
 	s := &sessionStore{path: path, data: map[string]conversation{}}
 	s.persist = &persistStore{flush: s.flush}
 	if b, err := os.ReadFile(path); err == nil {

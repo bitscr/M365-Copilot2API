@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -93,17 +94,23 @@ func openSessionResolver() *sessionResolver {
 }
 
 func (sr *sessionResolver) loadLocked() {
-	if b, err := os.ReadFile(sr.path); err == nil {
-		var list []sessionBinding
-		if err := json.Unmarshal(b, &list); err == nil {
-			now := time.Now().UTC()
-			for _, s := range list {
-				if now.Sub(s.LastUsedAt) > sr.ttl {
-					continue
-				}
-				sr.reindexLocked(s)
-			}
+	b, err := os.ReadFile(sr.path)
+	if err != nil {
+		return
+	}
+	var list []sessionBinding
+	if err := json.Unmarshal(b, &list); err != nil {
+		// Never fail silently: a corrupt/foreign-format sessions.json silently
+		// drops every binding, which looks like "sessions stopped resuming".
+		log.Printf("[session-resolver] failed to unmarshal %s: %v", sr.path, err)
+		return
+	}
+	now := time.Now().UTC()
+	for _, s := range list {
+		if now.Sub(s.LastUsedAt) > sr.ttl {
+			continue
 		}
+		sr.reindexLocked(s)
 	}
 }
 
