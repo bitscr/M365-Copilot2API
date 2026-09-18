@@ -1505,7 +1505,8 @@ func (s *Server) adminModelTest(w http.ResponseWriter, r *http.Request) {
 	})
 	ms := time.Since(start).Milliseconds()
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "m365_error", upstreamError(err))
+		code, msg := actionableUpstreamError(err)
+		writeOpenAIError(w, upstreamStatus(err), code, msg)
 		return
 	}
 	jsonOut(w, map[string]any{"ok": true, "model": b.Model, "reply": sanitizePublicAssistantTextForModel(res.Text, b.Model), "latency_ms": ms})
@@ -2159,15 +2160,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if convReused {
 				s.invalidateConvCache(acc.ID, convCacheModel)
 			}
-			msg := upstreamError(err)
+			code, msg := actionableUpstreamError(err)
 			if IsRateLimited(err) {
-				msg = "upstream is rate limiting; try again shortly"
+				code, msg = "rate_limit_error", "upstream is rate limiting; try again shortly"
 			}
 			if errors.Is(err, chathub.ErrOffensiveContent) {
-				msg = "M365 content policy flagged this request as offensive"
+				code, msg = "upstream_content_blocked", "M365 content policy flagged this request as offensive"
 			}
 			msg = sanitizePublicInternalText(msg)
-			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": code}})+"\n\n")
 			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 			return
 		}
@@ -2283,11 +2284,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if routeErr != nil {
-				msg := upstreamError(routeErr)
+				code, msg := actionableUpstreamError(routeErr)
 				if IsRateLimited(routeErr) {
-					msg = "upstream is rate limiting; try again shortly"
+					code, msg = "rate_limit_error", "upstream is rate limiting; try again shortly"
 				}
-				writeOpenAIError(w, http.StatusBadGateway, "tool_router_error", msg)
+				writeOpenAIError(w, http.StatusBadGateway, code, msg)
 				return
 			}
 		}
@@ -2492,15 +2493,15 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			if convReused {
 				s.invalidateConvCache(acc.ID, convCacheModel)
 			}
-			msg := upstreamError(err)
+			code, msg := actionableUpstreamError(err)
 			if IsRateLimited(err) {
-				msg = "upstream is rate limiting; try again shortly"
+				code, msg = "rate_limit_error", "upstream is rate limiting; try again shortly"
 			}
 			if errors.Is(err, chathub.ErrOffensiveContent) {
-				msg = "M365 content policy flagged this request as offensive"
+				code, msg = "upstream_content_blocked", "M365 content policy flagged this request as offensive"
 			}
 			msg = sanitizePublicInternalText(msg)
-			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": code}})+"\n\n")
 		}
 		pt := EstimateTokens(prompt)
 		ct := EstimateTokens(res.Text)

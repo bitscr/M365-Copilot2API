@@ -22,14 +22,39 @@ func logOAuthError(stage string, err error) {
 	log.Printf("oauth_error stage=%s error=%q", stage, "request_failed")
 }
 
-// upstreamError keeps transport details, including URLs and credentials, out
-// of client-visible responses while retaining a server-side diagnostic.
-func upstreamError(err error) string {
+// actionableUpstreamError returns a safe, useful client-facing explanation.
+// Raw provider details remain in gateway logs, but users should be told what
+// failed and what they can do instead of receiving a generic authentication
+// banner from the client.
+func actionableUpstreamError(err error) (code, message string) {
 	if err == nil {
-		return "upstream request failed"
+		return "upstream_error", "M365 upstream request failed. Retry once; if it continues, check the gateway account status and recent logs."
 	}
-	log.Printf("upstream request failed: %v", err)
-	return "upstream request failed"
+	cat := ClassifyError(err)
+	switch cat {
+	case CategoryAuthExpired401:
+		return "m365_account_expired", "The selected M365 account token has expired or was revoked. Refresh or re-authorize that account in the gateway console, then retry. If account failover is enabled, verify that at least one other account is healthy."
+	case CategoryForbidden403:
+		return "m365_account_forbidden", "Microsoft rejected this M365 account for the requested operation. Check that the account still has Copilot access and the required tenant/license permissions, or switch to another healthy account."
+	case CategoryUserBanned:
+		return "m365_account_disabled", "The selected M365 account is disabled or blocked upstream. Remove it from rotation and authorize another account."
+	case CategoryDesignerDisabled:
+		return "m365_feature_unavailable", "This M365 tenant does not allow the requested feature. Use a supported model or feature, or switch to an account whose tenant enables it."
+	case CategoryQuota429, CategoryUserThrottled, CategoryInsufficientTokens:
+		return "rate_limit_error", "The selected M365 account has reached a usage or rate limit. Wait for the reported retry interval or switch to another healthy account."
+	case CategoryOverload503:
+		return "upstream_overloaded", "Microsoft's upstream service is temporarily overloaded. Retry shortly; the gateway will use another healthy account when possible."
+	case CategoryDNS, CategoryTCP, CategoryTLS, CategorySOCKS5, CategoryWSHandshake:
+		return "upstream_connection_error", "The gateway could not connect to Microsoft. Check DNS, outbound proxy and TLS connectivity from the server, then retry."
+	case CategoryWSReadTimeout:
+		return "upstream_timeout", "Microsoft did not complete the response before the gateway timeout. Retry the request or increase the chat timeout in gateway settings."
+	case CategoryClientCanceled:
+		return "request_canceled", "The request was canceled before completion. Retry it and keep the client connection open until a terminal event is received."
+	case CategoryRetryable422:
+		return "upstream_rejected_request", "Microsoft temporarily rejected this request. Retry once; if it repeats, reduce the conversation context or start a new conversation."
+	default:
+		return "upstream_error", "M365 could not complete the request. Retry once; if it continues, check account health and the gateway logs using the request ID."
+	}
 }
 
 // upstreamStatus maps a failed upstream call to the client-visible HTTP status:
@@ -134,7 +159,9 @@ func writeUpstreamErrorWithAccount(w http.ResponseWriter, err error, accountID s
 		writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_content_blocked", "M365 content policy blocked this request; try again or switch account")
 		return
 	}
-	writeOpenAIError(w, status, "upstream_error", upstreamError(err))
+	code, msg := actionableUpstreamError(err)
+	log.Printf("upstream request failed: %v", err)
+	writeOpenAIError(w, status, code, msg)
 }
 
 func IsRetryable(err error) bool {
@@ -201,5 +228,7 @@ func writeUpstreamError(w http.ResponseWriter, err error) {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_content_blocked", "M365 content policy blocked this request; try again or switch account")
 		return
 	}
-	writeOpenAIError(w, status, "upstream_error", upstreamError(err))
+	code, msg := actionableUpstreamError(err)
+	log.Printf("upstream request failed: %v", err)
+	writeOpenAIError(w, status, code, msg)
 }

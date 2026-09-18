@@ -173,14 +173,16 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		if designerToken == "" {
 			designerToken, err = s.designerAccessToken(acc)
 			if err != nil {
-				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", upstreamError(err))
+				code, msg := actionableUpstreamError(err)
+				writeOpenAIError(w, upstreamStatus(err), code, msg)
 				return
 			}
 		}
 		imageData, contentType, err := downloadDesignerImage(ctx, sourceURL, designerToken)
 		if err != nil {
 			log.Printf("[image-gen-download] err=%v", err)
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", upstreamError(err))
+			code, msg := actionableUpstreamError(err)
+			writeOpenAIError(w, upstreamStatus(err), code, msg)
 			return
 		}
 		if format == "b64_json" {
