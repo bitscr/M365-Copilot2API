@@ -2039,11 +2039,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		var streamedTools []detectedToolCall
 		first := true
 		identityFilter := newPublicIdentityStreamFilter(model)
-		emitText := func(part string) error {
-			if part == "" {
-				return nil
-			}
-			part = identityFilter.Push(part)
+		// writeTextDelta emits one content delta verbatim (no filtering). Both
+		// the filtered stream and its end-of-stream tail go through here so the
+		// `first`/role bookkeeping stays in one place.
+		writeTextDelta := func(part string) error {
 			if part == "" {
 				return nil
 			}
@@ -2056,11 +2055,20 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				first = false
 			}
 			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}}
-			if err := sw.data(mustJSON(chunk)); err != nil {
-				return err
-			}
-			return nil
+			return sw.data(mustJSON(chunk))
 		}
+		emitText := func(part string) error {
+			if part == "" {
+				return nil
+			}
+			return writeTextDelta(identityFilter.Push(part))
+		}
+		// flushText releases the filter's held-back tail. The filter keeps ~64
+		// trailing bytes so a marker or entity tag split across deltas is never
+		// emitted in pieces; forgetting this flush drops the last characters of
+		// every answer (observed: text cut mid-sentence right before the finish
+		// frame). Every terminal branch that streamed text must call it.
+		flushText := func() error { return writeTextDelta(identityFilter.Flush()) }
 		res, err := s.chatWithAccountEvents(ctx, acc.ID, account, answerReq, func(ev chathub.StreamEvent) error {
 			if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
 				toolKnown := false
@@ -2209,6 +2217,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if len(calls) > 0 {
+			// The stream may have carried preamble text before the tool call;
+			// release its held-back tail so the client sees the full preamble.
+			_ = flushText()
 			log.Printf("[req-trace] id=%s stage=tool_calls_detected count=%d names=%v", requestID, len(calls), func() []string {
 				var n []string
 				for _, c := range calls {
@@ -2235,6 +2246,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		if len(res.Scores) > 0 {
 			finishChunk["x_m365_scores"] = res.Scores
 		}
+		// Release the filter's held-back tail before the terminal frames so the
+		// last characters of the answer are not dropped.
+		_ = flushText()
 		_ = sw.data(mustJSON(finishChunk))
 		_ = sw.data("[DONE]")
 		if res.Timestamps.RequestSent != "" {

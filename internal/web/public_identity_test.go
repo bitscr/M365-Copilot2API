@@ -242,6 +242,49 @@ func TestPublicIdentityStreamFilterScrubsInternalMarkersWhenPolicyDisabled(t *te
 	}
 }
 
+func TestPublicIdentityStreamFilterReleasesHeldTailOnFlush(t *testing.T) {
+	// Regression: the policy-off fast path holds back ~64 trailing bytes so a
+	// marker split across deltas is never emitted in pieces. If the caller
+	// forgets Flush(), those bytes are dropped and the answer is truncated
+	// mid-sentence. This pins that Push() alone is NOT enough and Flush()
+	// releases the exact remainder.
+	t.Setenv("M365_PUBLIC_IDENTITY_POLICY", "false")
+	answer := "服务器重启后，项目和正式 Cloudflare Tunnel 都会自动恢复。"
+	filter := newPublicIdentityStreamFilter()
+	var got strings.Builder
+	// Feed in irregular slices like the upstream SSE deltas.
+	for _, chunk := range []string{"服务器重启后，", "项目和正式 Cloudflare Tun", "nel 都会自", "动恢复。"} {
+		got.WriteString(filter.Push(chunk))
+	}
+	if got.String() == answer {
+		// If this ever passes without Flush, the holdback was removed; the test
+		// would no longer be exercising the bug, so fail loudly.
+		t.Fatalf("Push alone produced the full answer; holdback is gone, test is stale")
+	}
+	got.WriteString(filter.Flush())
+	if got.String() != answer {
+		t.Fatalf("flush did not reconstruct the answer:\n got %q\nwant %q", got.String(), answer)
+	}
+}
+
+func TestPublicIdentityStreamFilterWithoutFlushTruncates(t *testing.T) {
+	// Documents the exact failure the handler fix prevents: the tail (< holdback)
+	// is lost when Flush is skipped.
+	t.Setenv("M365_PUBLIC_IDENTITY_POLICY", "false")
+	answer := "服务器重启后，项目和正式 Cloudflare Tunnel 都会自动恢复。"
+	filter := newPublicIdentityStreamFilter()
+	var got strings.Builder
+	for _, chunk := range []string{"服务器重启后，", "项目和正式 Cloudflare Tun", "nel 都会自", "动恢复。"} {
+		got.WriteString(filter.Push(chunk))
+	}
+	if got.String() == answer {
+		t.Fatal("expected truncation without Flush")
+	}
+	if !strings.HasPrefix(answer, got.String()) {
+		t.Fatalf("emitted text is not a prefix of the answer: %q", got.String())
+	}
+}
+
 func TestSanitizePublicAssistantTextRemovesInternalFileTags(t *testing.T) {
 	input := "我没收到 <File>Report.pdf</File> 这个文件，请重新上传 report.pdf。"
 	for _, enabled := range []bool{true, false} {
