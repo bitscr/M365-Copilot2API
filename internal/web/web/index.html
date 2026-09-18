@@ -628,6 +628,15 @@ if (response.output_text) {
 <div class="form-group"><label class="form-label">确认新密码 / Confirm new password</label><input class="form-input" id="cpConfirm" type="password" autocomplete="new-password" minlength="6"></div>
 <div style="margin-top:16px"><button class="btn primary" onclick="changeAdminPassword()">修改密码 / Change password</button></div>
 </div></div>
+<div class="card" style="margin-top:16px"><div class="card-body">
+<h3 style="font-size:15px;font-weight:600;margin:0 0 14px">备份 / Backup</h3>
+<p class="form-hint" style="margin-top:0">导出全部数据（账号、API 密钥、会话、对话、管理密码）为 zip 压缩包；导入将覆盖当前数据，导入前服务端会自动保留一份 .pre-import 现场备份，完成后服务自动重启生效。</p>
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px">
+<button class="btn primary" onclick="exportBackup()">导出备份 / Export</button>
+<label class="btn" style="cursor:pointer">导入备份 / Import<input type="file" id="importBackupFile" accept=".zip" style="display:none" onchange="importBackup(this.files[0])"></label>
+</div>
+<div id="backupResult" style="margin-top:12px;display:none"></div>
+</div></div>
       </section>
     </div>
   </main>
@@ -1848,6 +1857,36 @@ async function changeAdminPassword(){
     $('cpCurrent').value=$('cpNew').value=$('cpConfirm').value='';
     showNotice('密码修改成功，请用新密码重新登录','success');
     setTimeout(()=>location.replace('/login'),1500);
+  }catch(e){showNotice(e.message,'error');}
+}
+
+async function exportBackup(){
+  try{
+    const r=await fetch('/api/admin/export');
+    if(!r.ok){const t=await r.text();throw Error(t);}
+    const b=await r.blob();
+    const m=(r.headers.get('Content-Disposition')||'').match(/filename="?([^";]+)/);
+    const name=m?m[1]:('m365-backup-'+new Date().toISOString().replace(/[:T]/g,'-').slice(0,19)+'.zip');
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(b);a.download=name;
+    document.body.appendChild(a);a.click();a.remove();
+    setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+    showNotice('备份已下载','success');
+  }catch(e){showNotice(e.message,'error');}
+}
+async function importBackup(file){
+  if(!file)return;
+  $('importBackupFile').value='';
+  if(!confirm('导入备份将覆盖当前全部数据（账号、API 密钥、会话、对话、管理密码），导入后服务会自动重启。\n\n确认继续？'))return;
+  const fd=new FormData();fd.append('file',file);
+  try{
+    const r=await fetch('/api/admin/import',{method:'POST',body:fd});
+    const t=await r.text();let d;try{d=JSON.parse(t);}catch{d={error:{message:t}};}
+    if(!r.ok)throw Error(d?.error?.message||t||'导入失败');
+    const el=$('backupResult');el.style.display='block';
+    const warn=(d.warnings&&d.warnings.length)?('<br><span style="color:#e0a63c">⚠️ '+d.warnings.join('<br>⚠️ ')+'</span>'):'';
+    el.innerHTML='<div class="highlight-box success"><b>导入成功</b>，服务正在重启…<br>恢复: '+(d.restored||[]).join(', ')+'<br>账号 '+d.accounts+' · 密钥 '+d.api_keys+' · 会话 '+d.sessions+'（'+d.messages+' 条消息）· 对话 '+d.conversations+warn+'</div>';
+    setTimeout(()=>location.reload(),2500);
   }catch(e){showNotice(e.message,'error');}
 }
 
