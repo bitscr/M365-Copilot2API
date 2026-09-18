@@ -239,7 +239,7 @@ func (s *settingsStore) save(v runtimeSettings) error {
 func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		jsonOut(w, map[string]any{"settings": s.settings.get(), "codexModels": configurableCodexModels, "upstreamTones": knownUpstreamTones(), "restartRequiredFields": []string{"listenAddress", "configPath", "tokenCachePath", "sessionCachePath", "outboundProxy", "proxyPool", "clientId", "authority", "redirectUri", "scope", "debugLogPath"}})
+		jsonOut(w, map[string]any{"settings": s.settings.get(), "codexModels": configurableCodexModels, "upstreamTones": knownUpstreamTones(), "restartRequiredFields": restartRequiredFields, "restartStrategy": RestartStrategy()})
 	case http.MethodPut:
 		// 前端可能只修改一个字段（如监听地址），其余字段以零值提交。
 		// 逐字段合并到当前设置再校验，避免"改一个字段弄丢其他配置"。
@@ -333,15 +333,43 @@ func limitToolCalls(c []detectedToolCall, n int) []detectedToolCall {
 
 func currentSettings() runtimeSettings { return openSettingsStore().get() }
 
-// ApplyStartupSettingsEnv loads persisted restart-required fields before the
-// rest of the application initializes. Explicit process environment variables
-// always win over values saved from the web console.
-func ApplyStartupSettingsEnv() {
-	s := openSettingsStore().get()
-	values := map[string]string{"M365_LISTEN": s.ListenAddress, "M365_CONFIG": s.ConfigPath, "M365_TOKEN_CACHE": s.TokenCachePath, "M365_SESSION_CACHE": s.SessionCachePath, outbound.EnvProxy: s.OutboundProxy, "M365_PROXY_POOL": strings.Join(s.ProxyPool, "\n"), "M365_CLIENT_ID": s.ClientID, "M365_AUTHORITY": s.Authority, "M365_REDIRECT_URI": s.RedirectURI, "M365_SCOPE": s.Scope, "M365_DEBUG_LOG": s.DebugLogPath}
-	for k, v := range values {
-		if _, exists := os.LookupEnv(k); !exists && strings.TrimSpace(v) != "" {
-			_ = os.Setenv(k, v)
+// startupSettingsEnvValues maps persisted settings to the environment variable
+// names they bootstrap.
+func startupSettingsEnvValues(s runtimeSettings) map[string]string {
+	return map[string]string{"M365_LISTEN": s.ListenAddress, "M365_CONFIG": s.ConfigPath, "M365_TOKEN_CACHE": s.TokenCachePath, "M365_SESSION_CACHE": s.SessionCachePath, outbound.EnvProxy: s.OutboundProxy, "M365_PROXY_POOL": strings.Join(s.ProxyPool, "\n"), "M365_CLIENT_ID": s.ClientID, "M365_AUTHORITY": s.Authority, "M365_REDIRECT_URI": s.RedirectURI, "M365_SCOPE": s.Scope, "M365_DEBUG_LOG": s.DebugLogPath}
+}
+
+// applyStartupSettings is the pure precedence core of ApplyStartupSettingsEnv,
+// extracted so it can be tested without the process-global settings store.
+// When envWins is false (the default), a non-empty saved value overwrites the
+// environment; when true, an existing environment variable is left untouched.
+func applyStartupSettings(s runtimeSettings, envWins bool, lookup func(string) (string, bool), set func(string, string) error) {
+	for k, v := range startupSettingsEnvValues(s) {
+		if strings.TrimSpace(v) == "" {
+			continue
 		}
+		if envWins {
+			if _, exists := lookup(k); exists {
+				continue
+			}
+		}
+		_ = set(k, v)
 	}
+}
+
+// ApplyStartupSettingsEnv loads persisted restart-required fields before the
+// rest of the application initializes. Values saved from the web console win
+// over the process environment, because a value can only reach the store by an
+// explicit admin action in the console; the environment is merely a bootstrap
+// default. This is what makes "change the listen port in the console, restart"
+// actually take effect even when M365_LISTEN (or a sibling field) is pinned in
+// an EnvironmentFile / docker-compose / systemd unit.
+//
+// A field with an empty saved value does NOT override the environment, so a
+// deployment that only configures things via env keeps working unchanged.
+// Set M365_SETTINGS_ENV_WINS=true to restore the legacy env-overrides-console
+// behavior (e.g. to hard-pin the bind address on a shared host).
+func ApplyStartupSettingsEnv() {
+	envWins := strings.EqualFold(strings.TrimSpace(os.Getenv("M365_SETTINGS_ENV_WINS")), "true")
+	applyStartupSettings(openSettingsStore().get(), envWins, os.LookupEnv, os.Setenv)
 }
