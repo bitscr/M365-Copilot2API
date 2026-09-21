@@ -2794,6 +2794,9 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			if attempt == 2 && len(toolMaps) > 0 {
 				correction = "STRICT FORMAT: Reply with exactly one tool call in the form CALL_TOOL: tool_name({\"arg\":\"value\"}) using the caller's declared tools. You have no execution environment of your own — every command, file read, or state change must be a caller tool call. Do not describe, claim, or deny execution; emit the call.\n\n" + correction
 			}
+			if attempt == 2 && len(toolMaps) == 0 {
+				correction = "Respond with EXACTLY this text and nothing else:\n\n我无法直接执行命令——当前请求没有附加任何执行工具，请提供工具或在本地自行运行。\n\nUser request:\n" + prompt
+			}
 			res2, err2 := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
 			if err2 != nil {
 				break

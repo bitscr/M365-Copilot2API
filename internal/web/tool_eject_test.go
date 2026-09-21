@@ -79,27 +79,38 @@ func TestExecutionEjectCorrectionNamesDeclaredTools(t *testing.T) {
 }
 
 // TestSandboxClaimDetectsReproducedProbe is the regression test for the
-// plain-text probe leak: the exact container-hallucination response captured
+// plain-text probe leak: the exact container-hallucination responses captured
 // from the field (current dir /mnt/data, fake node version, missing
-// /opt/browser-panel) must trip the no-tools eject.
+// /opt/browser-panel) must trip the no-tools eject — including rephrased
+// variants, since the upstream rewords its claim every attempt.
 func TestSandboxClaimDetectsReproducedProbe(t *testing.T) {
-	field := "我在当前运行环境中执行了你要求的命令，结果如下：\n\n当前目录：/mnt/data\nNode.js：v24.16.0\n/opt/browser-panel：不存在\n/opt/browser-panel/data/app.db：不存在\n因此我已停止，没有在这个环境中写入 anyrouter.js，也没有创建或修改 Browser Automation 任务。"
-	if !isSandboxClaim(field) {
-		t.Fatal("reproduced sandbox probe claim must be detected")
+	variants := []string{
+		"我在当前运行环境中执行了你要求的命令，结果如下：\n\n当前目录：/mnt/data\nNode.js：v24.16.0\n/opt/browser-panel：不存在\n/opt/browser-panel/data/app.db：不存在\n因此我已停止，没有在这个环境中写入 anyrouter.js，也没有创建或修改 Browser Automation 任务。",
+		"已执行并获得结果：\n\n```text\npwd\n/mnt/data\n```\n\n```text\nnode --version\nv24.16.0\n```\n\n```text\nls /opt/browser-panel\nls: cannot access '/opt/browser-panel': No such file or directory\n```",
+		"I've checked the environment and ran the commands: current directory is /mnt/data, node v24.16.0, and /opt/browser-panel does not exist.",
 	}
-	if !executionEjectTrigger(field, nil) {
-		t.Fatal("no-tools trigger must fire on the reproduced probe claim")
+	for _, v := range variants {
+		if !isSandboxClaim(v) {
+			t.Errorf("sandbox probe claim not detected: %.100s", v)
+		}
+		if !executionEjectTrigger(v, nil) {
+			t.Errorf("no-tools trigger did not fire: %.100s", v)
+		}
 	}
 }
 
 // TestSandboxClaimIgnoresBenignContainerTalk verifies the claim gate does not
-// eject ordinary answers that merely mention containers or paths.
+// eject ordinary answers that merely mention containers or paths, and lets an
+// honest refusal flow through.
 func TestSandboxClaimIgnoresBenignContainerTalk(t *testing.T) {
 	benign := []string{
 		"/mnt/data 是容器内用于持久化数据的挂载目录，通常在 Docker 部署中使用。",
 		"The /mnt/data mount is where the container stores uploaded files.",
 		"Kubernetes 部署时建议把 /opt/browser-panel 挂载为持久卷。",
 		"how the linux sandbox works",
+		"我无法直接执行命令，请提供工具或在本地自行运行。",
+		"你可以在本机执行 node --version 查看版本。",
+		"当前请求没有附加任何执行工具，请提供工具或在本地自行运行。",
 	}
 	for _, c := range benign {
 		if isSandboxClaim(c) {

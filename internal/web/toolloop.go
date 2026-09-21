@@ -356,6 +356,13 @@ var sandboxClaimMarkers = []string{
 // declared (the plain-text probe case): a response claiming "/mnt/data" +
 // fake node version + "the command was executed" is the OAI container talking,
 // and it must not reach the caller as if it were local ground truth.
+//
+// Detection is deliberately structural, not just keyword-exact: the upstream
+// model rephrases its claims every attempt ("我在当前运行环境中执行了...",
+// "已执行并获得结果", "I've checked the environment..."), so the gate pairs
+// an execution verb with a cloud-container artifact signature. Either side
+// alone (a verb list hit, or a mere mention of /mnt/data) is not enough —
+// benign answers that discuss containers keep flowing.
 func isSandboxClaim(text string) bool {
 	if !isSandboxHallucination(text) {
 		return false
@@ -364,6 +371,39 @@ func isSandboxClaim(text string) bool {
 	for _, m := range sandboxClaimMarkers {
 		if strings.Contains(low, strings.ToLower(m)) {
 			return true
+		}
+	}
+	// Structural fallback: execution framing + container artifact, phrasing
+	// independent. Covers "已执行并获得结果：... 当前目录：/mnt/data ...".
+	executionVerb := false
+	for _, v := range []string{
+		"已执行", "执行了", "我执行", "已运行", "运行了", "我运行", "执行结果", "运行结果",
+		"获得结果", "结果如下", "检查结果", "输出如下", "执行完成", "已完成执行",
+		"i executed", "i ran", "already executed", "executed the", "ran the",
+		"execution results", "results are", "output:", "the output",
+	} {
+		if strings.Contains(low, v) {
+			executionVerb = true
+			break
+		}
+	}
+	if !executionVerb {
+		return false
+	}
+	for _, s := range []string{
+		"/mnt/data", "/mnt/", "linux container", "sandbox", "container", "沙箱", "容器",
+	} {
+		if strings.Contains(low, s) {
+			return true
+		}
+	}
+	// Last structural signal: a fenced shell-output block (```text / pwd /
+	// node --version / ls ...) inside an execution-framed answer.
+	if strings.Contains(low, "```") {
+		for _, cmd := range []string{"pwd", "node --version", "node -v", "ls /", "uname", "whoami", "printenv"} {
+			if strings.Contains(low, cmd) {
+				return true
+			}
 		}
 	}
 	return false
@@ -394,14 +434,15 @@ func executionIntent(text string) bool {
 }
 
 // executionEjectTrigger decides whether held/returned upstream text must be
-// ejected: with tools declared, any sandbox/refusal signature trips it; with
-// no tools, only explicit execution claims do (so normal chat about
-// containers keeps flowing).
+// ejected: with tools declared, any sandbox/refusal signature trips it (the
+// model must call a tool, not refuse); with no tools, only explicit execution
+// claims do — an honest refusal ("我无法执行命令") is the DESIRED answer and
+// flows through, while fake container output is dropped.
 func executionEjectTrigger(text string, toolMaps []map[string]any) bool {
 	if len(toolMaps) > 0 {
 		return isToolRefusal(text) || isSandboxHallucination(text)
 	}
-	return isToolRefusal(text) || isSandboxClaim(text)
+	return isSandboxClaim(text)
 }
 
 // executionImpossibleCorrection is the corrective prompt for requests that
