@@ -13,7 +13,8 @@ func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any) st
 - If no tool is needed, respond with: NO_TOOL_NEEDED
 - Only use tools from the available list above
 - Validate all arguments against the tool's schema
-- Do not invent tools that are not in the list`
+- Do not invent tools that are not in the list
+- Never claim to run, execute, or access anything yourself: the tools execute on the caller's machine, not in your environment. You have no sandbox, container, or file system of your own. Output only CALL_TOOL or NO_TOOL_NEEDED.`
 	// Multi-turn: completed tool evidence (tool[...], tool_calls:) was already
 	// acted upon, so re-invoking those tools would duplicate work.
 	if strings.Contains(prompt, "tool_calls:") || strings.Contains(prompt, "tool[call_") {

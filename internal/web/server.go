@@ -1671,6 +1671,13 @@ func buildAnswerRequest(answerPrompt, tone string, body oaiReq, ledger agentLedg
 	if len(ledger.Completed) > 0 {
 		answerPrompt += "\nFINAL ANSWER RULE: Report only actions supported by completed tool results. If the goal is not fully verified, state exactly what remains unconfirmed."
 	}
+	if len(body.Tools) > 0 {
+		// Execution boundary: the upstream model lives in Microsoft's cloud
+		// (the OAI container) and has no access to caller files. Without this
+		// rule it tends to claim it "ran" things in its built-in code
+		// interpreter / Linux sandbox and reports caller files as missing.
+		answerPrompt += "\nEXECUTION BOUNDARY: The caller's tools execute on the caller's own machine. You have no built-in code interpreter, sandbox, container, or file system of your own. Never claim to have run code, accessed files, or changed state yourself. If an action is needed, call the appropriate caller tool."
+	}
 	req := chathub.Request{Text: answerPrompt, Tone: tone, ConversationID: body.ConversationID, SessionID: body.SessionID, Attachments: body.Attachments, LicenseType: cfg.LicenseType, Scenario: cfg.Scenario, FeatureFlags: flags, Locale: locale.Locale, Market: locale.Market, TimeZone: locale.TimeZone, TimeZoneOffset: locale.TimeZoneOffset, DeviceOS: locale.DeviceOS, DisableMemory: disableMemory}
 	if planningMode == "native" {
 		req.Tools = body.Tools
@@ -1865,32 +1872,38 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Conversation cache: reuse existing M365 conversation for same account+model
-	// to avoid re-processing full system prompt + history each request (latency
-	// drops from 3-5s to ~1s). Only kicks in when no explicit conversation ID
-	// was provided by client, session key, user session, or session resolver.
+	// Conversation cache: reuse existing M365 conversation for same
+	// account+model+tenant to avoid re-processing full system prompt + history
+	// each request (latency drops from 3-5s to ~1s). Only kicks in when no
+	// explicit conversation ID was provided by client, session key, user
+	// session, or session resolver. The cache slot is scoped per API key
+	// (tenant) and a hit additionally requires the caller's message prefix to
+	// fingerprint identically to the stored history — two tasks that share the
+	// same account, model and system prompt template but diverge in content
+	// never inherit each other's cloud conversation, which previously caused
+	// cross-task memory bleed (model citing another task's files/names).
 	convReused := false
 	convCacheModel := firstNonEmpty(body.Model, "m365-copilot")
+	tenant := tenantFromRequest(r)
 	if body.ConversationID == "" && len(body.Messages) > 1 &&
 		(body.Metadata == nil || !body.Metadata.CopilotTempSession) {
-		sysHash := systemPromptHash(body.Messages)
-		if cached := s.convCache.Lookup(acc.ID, convCacheModel); cached != nil && cached.SystemPrompt == sysHash {
-			if len(body.Messages) > cached.MessageCount {
-				incPrompt, incAtt := flattenPromptMessages(body.Messages[cached.MessageCount:], nil)
-				incPrompt = strings.TrimSpace(incPrompt)
-				if incPrompt != "" {
-					body.ConversationID = cached.ConversationID
-					body.SessionID = cached.SessionID
-					answerPrompt = incPrompt
-					body.Attachments = incAtt
-					convReused = true
-					log.Printf("[conv-cache] hit account=%s model=%s conversation=%s cached_msgs=%d new_msgs=%d", acc.ID, convCacheModel, cached.ConversationID, cached.MessageCount, len(body.Messages))
-				}
+		if cached := s.convCache.Lookup(acc.ID, convCacheModel, tenant); convCacheHit(cached, body.Messages) {
+			incPrompt, incAtt := flattenPromptMessages(body.Messages[cached.MessageCount:], nil)
+			incPrompt = strings.TrimSpace(incPrompt)
+			if incPrompt != "" {
+				body.ConversationID = cached.ConversationID
+				body.SessionID = cached.SessionID
+				answerPrompt = incPrompt
+				body.Attachments = incAtt
+				convReused = true
+				log.Printf("[conv-cache] hit tenant=%s account=%s model=%s conversation=%s cached_msgs=%d new_msgs=%d", tenant, acc.ID, convCacheModel, cached.ConversationID, cached.MessageCount, len(body.Messages))
 			}
+		} else if cached != nil {
+			log.Printf("[conv-cache] prefix-mismatch tenant=%s account=%s model=%s cached_msgs=%d new_msgs=%d (no reuse)", tenant, acc.ID, convCacheModel, cached.MessageCount, len(body.Messages))
 		}
 	}
 	if !convReused && body.ConversationID == "" {
-		log.Printf("[conv-cache] miss account=%s model=%s", acc.ID, convCacheModel)
+		log.Printf("[conv-cache] miss tenant=%s account=%s model=%s", tenant, acc.ID, convCacheModel)
 	}
 
 	// Normalize tools once. Selection is always made by the upstream model;
@@ -2072,6 +2085,17 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// every answer (observed: text cut mid-sentence right before the finish
 		// frame). Every terminal branch that streamed text must call it.
 		flushText := func() error { return writeTextDelta(identityFilter.Flush()) }
+		// Execution-boundary hold buffer. When tools are declared, upstream text
+		// that claims container/sandbox execution (see sandboxHallucinationPatterns)
+		// must never reach the caller: the upstream model lives in its own cloud
+		// container and reports the caller's files as missing from there. Deltas
+		// are held until either a sandbox/refusal signature matches (abort the
+		// stream and re-ask corrected) or a flush threshold is crossed (normal
+		// answer, keep streaming).
+		holdActive := len(toolMaps) > 0
+		const holdLimit = 4000
+		var held string
+		ejected := false
 		res, err := s.chatWithAccountEvents(ctx, acc.ID, account, answerReq, func(ev chathub.StreamEvent) error {
 			if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
 				toolKnown := false
@@ -2094,8 +2118,72 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				return nil
 			}
 			text.WriteString(ev.Text)
+			if holdActive {
+				held += ev.Text
+				if isSandboxHallucination(held) || isToolRefusal(held) {
+					ejected = true
+					holdActive = false
+					return errSandboxEject
+				}
+				if len(held) >= holdLimit || (len(held) >= 512 && strings.ContainsAny(held, "。.!?\n")) {
+					holdActive = false
+					return emitText(held)
+				}
+				return nil
+			}
 			return emitText(ev.Text)
 		})
+		if errors.Is(err, errSandboxEject) && ejected {
+			// The upstream claimed it ran the tool in its own container
+			// instead of returning a call for the caller's machine. Drop the
+			// held text, re-ask with the execution-boundary correction, and
+			// forward the corrected response (tool call or clean text).
+			log.Printf("[sandbox-eject] id=%s upstream claimed container execution mid-stream; dropping held text and re-asking with correction", requestID)
+			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: executionEjectCorrection(prompt, toolMaps), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+			if retryErr == nil {
+				calls, _ := validateCalls("sandbox-eject", fencedToolCalls(retryRes.Text, toolMaps, body.ToolChoice))
+				if len(calls) == 0 {
+					if parsed, ok := parseModelToolDecision(retryRes.Text, toolMaps, body.ToolChoice); ok {
+						calls, _ = validateCalls("sandbox-eject-parse", parsed)
+					}
+				}
+				if len(calls) > 0 {
+					calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
+					if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
+						calls = calls[:1]
+					}
+					_ = writeToolResponse(w, id, model, true, body.shouldSendStreamUsage(), calls, retryRes)
+					if body.User != "" && retryRes.ConversationID != "" {
+						s.userSessions.Put(tenantFromRequest(r), body.User, retryRes.ConversationID, retryRes.SessionID, acc.ID)
+					}
+					s.bindConversation(acc, &body, r, retryRes, answerPrompt, startedAt)
+					s.storeConvCache(tenant, acc.ID, convCacheModel, retryRes, tone, body.Messages, convReused)
+					return
+				}
+				if !isSandboxHallucination(retryRes.Text) && !isToolRefusal(retryRes.Text) {
+					// Clean corrected answer: stream it as the response.
+					res = retryRes
+					text.Reset()
+					text.WriteString(retryRes.Text)
+					if emitErr := emitText(retryRes.Text); emitErr != nil {
+						return
+					}
+					err = nil
+				} else {
+					log.Printf("[sandbox-eject] id=%s upstream kept claiming container execution after correction", requestID)
+					_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "upstream repeatedly claimed sandbox/container execution instead of returning a tool call", "code": "upstream_error"}})+"\n\n")
+					_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
+					return
+				}
+			} else {
+				log.Printf("[sandbox-eject] id=%s correction retry failed: %v", requestID, retryErr)
+				code, msg := actionableUpstreamError(retryErr)
+				msg = sanitizePublicInternalText(msg)
+				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": code}})+"\n\n")
+				_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
+				return
+			}
+		}
 		if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
 			originalErr := err
 			// A throttled stream may retry on the next healthy account: only the
@@ -2158,7 +2246,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				s.accountPool.MarkImageLimited(acc.ID)
 			}
 			if convReused {
-				s.invalidateConvCache(acc.ID, convCacheModel)
+				s.invalidateConvCache(acc.ID, convCacheModel, tenant)
 			}
 			code, msg := actionableUpstreamError(err)
 			if IsRateLimited(err) {
@@ -2239,7 +2327,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
 			}
 			s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
-			s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
+			s.storeConvCache(tenant, acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 			return
 		}
 		finishChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}
@@ -2261,7 +2349,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
 		}
 		s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
-		s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
+		s.storeConvCache(tenant, acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 		return
 	}
 	// Ask the upstream model to select and validate the next tool. The gateway
@@ -2415,9 +2503,26 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}
 		}()
 		streamedReasoningLen := 0
+		holdActiveB := len(toolMaps) > 0
+		const holdLimitB = 4000
+		var heldB string
+		ejectedB := false
 		onDeltaWrapped := func(content string) error {
 			if content != "" {
 				streamedReasoningLen += len(content)
+			}
+			if holdActiveB {
+				heldB += content
+				if isSandboxHallucination(heldB) || isToolRefusal(heldB) {
+					ejectedB = true
+					holdActiveB = false
+					return errSandboxEject
+				}
+				if len(heldB) >= holdLimitB || (len(heldB) >= 512 && strings.ContainsAny(heldB, "。.!?\n")) {
+					holdActiveB = false
+					return onDelta(heldB)
+				}
+				return nil
 			}
 			return onDelta(content)
 		}
@@ -2428,6 +2533,53 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			return onReasoning(reasoning)
 		}
 		res, err = s.chatWithAccountReasoning(ctx, acc.ID, account, answerReq, onDeltaWrapped, onReasoningWrapped)
+		if errors.Is(err, errSandboxEject) && ejectedB {
+			// Same execution-boundary eject as the tool-streaming path: the
+			// upstream claimed container/sandbox execution instead of
+			// returning a call for the caller's machine.
+			log.Printf("[sandbox-eject] id=%s reasoning stream claimed container execution; re-asking with correction", requestID)
+			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: executionEjectCorrection(prompt, toolMaps), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+			if retryErr == nil {
+				calls, _ := validateCalls("sandbox-eject-r", fencedToolCalls(retryRes.Text, toolMaps, body.ToolChoice))
+				if len(calls) == 0 {
+					if parsed, ok := parseModelToolDecision(retryRes.Text, toolMaps, body.ToolChoice); ok {
+						calls, _ = validateCalls("sandbox-eject-r-parse", parsed)
+					}
+				}
+				if len(calls) > 0 {
+					calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
+					if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
+						calls = calls[:1]
+					}
+					_ = writeToolResponse(w, id, model, true, body.shouldSendStreamUsage(), calls, retryRes)
+					if body.User != "" && retryRes.ConversationID != "" {
+						s.userSessions.Put(tenantFromRequest(r), body.User, retryRes.ConversationID, retryRes.SessionID, acc.ID)
+					}
+					s.bindConversation(acc, &body, r, retryRes, answerPrompt, startedAt)
+					s.storeConvCache(tenant, acc.ID, convCacheModel, retryRes, tone, body.Messages, convReused)
+					return
+				}
+				if !isSandboxHallucination(retryRes.Text) && !isToolRefusal(retryRes.Text) {
+					res = retryRes
+					if writeErr := onDelta(retryRes.Text); writeErr != nil {
+						return
+					}
+					err = nil
+				} else {
+					log.Printf("[sandbox-eject] id=%s upstream kept claiming container execution after correction", requestID)
+					_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "upstream repeatedly claimed sandbox/container execution instead of returning a tool call", "code": "upstream_error"}})+"\n\n")
+					_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
+					return
+				}
+			} else {
+				log.Printf("[sandbox-eject] id=%s correction retry failed: %v", requestID, retryErr)
+				code, msg := actionableUpstreamError(retryErr)
+				msg = sanitizePublicInternalText(msg)
+				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": code}})+"\n\n")
+				_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
+				return
+			}
+		}
 		if err != nil && streamedReasoningLen == 0 && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
 			originalErr := err
 			next, nerr := s.nextHealthyAccount(acc.ID)
@@ -2491,7 +2643,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				s.accountPool.MarkImageLimited(acc.ID)
 			}
 			if convReused {
-				s.invalidateConvCache(acc.ID, convCacheModel)
+				s.invalidateConvCache(acc.ID, convCacheModel, tenant)
 			}
 			code, msg := actionableUpstreamError(err)
 			if IsRateLimited(err) {
@@ -2574,7 +2726,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			s.accountPool.MarkImageLimited(acc.ID)
 		}
 		if convReused {
-			s.invalidateConvCache(acc.ID, convCacheModel)
+			s.invalidateConvCache(acc.ID, convCacheModel, tenant)
 			log.Printf("[conv-cache] invalidated account=%s model=%s after error: %v", acc.ID, convCacheModel, err)
 		}
 		writeUpstreamErrorWithAccount(w, err, acc.ID)
@@ -2589,7 +2741,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
 		}
 		s.bindConversation(acc, &body, r, res, prompt, startedAt)
-		s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
+		s.storeConvCache(tenant, acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 		return
 	}
 
@@ -2602,7 +2754,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	}
 	if res.ConversationID != "" {
 		s.bindConversation(acc, &body, r, res, prompt, startedAt)
-		s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
+		s.storeConvCache(tenant, acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 	}
 	if res.ConversationID != "" {
 		resolved := s.sessionResolver.Resolve(r, &body)
@@ -2615,20 +2767,31 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		model = "m365-copilot"
 	}
 	id := "chatcmpl-" + uuid.NewString()
-	if len(toolMaps) > 0 && isToolRefusal(res.Text) {
-		log.Printf("[tool-eject] model refused tools, retrying with correction")
-		correction := "Your previous response incorrectly denied that caller tools are available. They are real, active, and callable on the caller's Windows machine. Call the appropriate tool now. Do not explain tool availability.\n\nUser request:\n" + prompt
-		res2, err2 := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
-		if err2 == nil && !isToolRefusal(res2.Text) {
+	if len(toolMaps) > 0 && (isToolRefusal(res.Text) || isSandboxHallucination(res.Text)) {
+		// The upstream model either denied the caller's tools or claimed it
+		// executed them inside its own cloud container (where the caller's
+		// files do not exist — the "file not found" symptoms). Retry with an
+		// escalating correction that names the actual declared tools, and
+		// never leak the hallucinated answer to the client if retries fail.
+		log.Printf("[tool-eject] id=%s model refused tools or claimed container execution, retrying with correction", requestID)
+		for attempt := 1; attempt <= 2; attempt++ {
+			correction := executionEjectCorrection(prompt, toolMaps)
+			if attempt == 2 {
+				correction = "STRICT FORMAT: Reply with exactly one tool call in the form CALL_TOOL: tool_name({\"arg\":\"value\"}) using the caller's declared tools. You have no execution environment of your own — every command, file read, or state change must be a caller tool call. Do not describe, claim, or deny execution; emit the call.\n\n" + correction
+			}
+			res2, err2 := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+			if err2 != nil {
+				break
+			}
 			res = res2
+			if !isToolRefusal(res2.Text) && !isSandboxHallucination(res2.Text) {
+				break
+			}
 		}
-	}
-	if len(toolMaps) > 0 && isSandboxHallucination(res.Text) {
-		log.Printf("[sandbox-eject] model used code interpreter/sandbox, retrying with explicit tool instruction")
-		correction := "CRITICAL: You must NOT use any built-in code interpreter, Python sandbox, or cloud execution environment. The caller has provided a bash tool that runs Windows PowerShell 5.1 on their local machine — use it to execute any commands or code. Do NOT say you cannot run code. Do NOT say you only have a Linux container. Do NOT say you have no Windows execution channel. You DO have a bash tool that runs on Windows. Call the bash tool NOW with the appropriate PowerShell command.\n\nUser request:\n" + prompt
-		res2, err2 := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
-		if err2 == nil && !isSandboxHallucination(res2.Text) {
-			res = res2
+		if isToolRefusal(res.Text) || isSandboxHallucination(res.Text) {
+			log.Printf("[tool-eject] id=%s upstream kept refusing tools / claiming container execution after retries", requestID)
+			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream refused to use the caller's declared tools and claimed execution in its own container instead; no tool call was produced. Retry or check the upstream model's tool support.")
+			return
 		}
 	}
 	invalidDetectedTool := false

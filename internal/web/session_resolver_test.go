@@ -102,6 +102,106 @@ func resolverTestRequest(ip, ua, user string) *http.Request {
 	return r
 }
 
+// TestSuffixMatchRejectsToolTailedCrossTask is the regression test for the
+// multi-task memory cross-talk: two concurrent tasks on the same box produce
+// identical tool round tails (same tool call + same output, e.g. git status
+// on the same repo). A 2-message tail of [assistant(tool_calls), tool(result)]
+// must never bind task B to task A's cloud conversation, otherwise the
+// upstream resumes task A's history and the local agent chases names that
+// never existed in task B.
+func TestSuffixMatchRejectsToolTailedCrossTask(t *testing.T) {
+	t.Setenv("M365_SESSION_CACHE", filepath.Join(t.TempDir(), "sessions.json"))
+	sr := openSessionResolver()
+
+	gitCall := []map[string]any{{
+		"id":       "call_old_id",
+		"type":     "function",
+		"function": map[string]any{"name": "bash", "arguments": `{"command":"git status"}`},
+	}}
+	toolResult := oaiMsg{Role: "tool", ToolCallID: "call_old_id", Content: "nothing to commit, working tree clean"}
+
+	// Task A stored history ends with the tool round.
+	sr.Bind("", "conv-taskA", "acc1",
+		&oaiReq{Messages: []oaiMsg{
+			{Role: "user", Content: "检查 git 状态"},
+			{Role: "assistant", ToolCalls: gitCall},
+			toolResult,
+		}},
+		"",
+		resolverTestRequest("203.0.113.10", "client-a", "alice"))
+
+	// Task B sends a DIFFERENT conversation whose tail happens to end with the
+	// same tool call + identical tool output. Old code suffix-matched on the
+	// 2-message tool tail and resumed task A; the fixed code must not.
+	taskB := &oaiReq{Messages: []oaiMsg{
+		{Role: "user", Content: "taskB 自己的问题"},
+		{Role: "assistant", Content: "taskB 自己的回答"},
+		{Role: "assistant", ToolCalls: gitCall},
+		toolResult,
+	}}
+	res := sr.Resolve(resolverTestRequest("203.0.113.10", "client-a", "bob"), taskB)
+	if !res.IsNew {
+		t.Fatalf("tool-tailed suffix must NOT bind a different task's session, got matched=%s conv=%s", res.MatchedBy, res.ConversationID)
+	}
+}
+
+// TestSuffixMatchAcceptsConversationalResume verifies a genuinely truncated
+// client (kept recent turns, dropped old ones) still resumes its own session
+// through the suffix path when the matched tail contains a user message.
+func TestSuffixMatchAcceptsConversationalResume(t *testing.T) {
+	t.Setenv("M365_SESSION_CACHE", filepath.Join(t.TempDir(), "sessions.json"))
+	sr := openSessionResolver()
+
+	sr.Bind("", "conv-taskA", "acc1",
+		&oaiReq{Messages: []oaiMsg{
+			{Role: "user", Content: "第一轮问题"},
+			{Role: "assistant", Content: "第一轮回答"},
+			{Role: "user", Content: "第二轮问题"},
+			{Role: "assistant", Content: "第二轮回答"},
+		}},
+		"",
+		resolverTestRequest("203.0.113.10", "client-a", "alice"))
+
+	// Client truncated its local history to the recent turns and re-sent them
+	// (reload/retry after losing early history): the tail of the stored
+	// history is reproduced verbatim, with a user message in the window.
+	res := sr.Resolve(resolverTestRequest("203.0.113.10", "client-a", "alice"),
+		&oaiReq{Messages: []oaiMsg{
+			{Role: "user", Content: "第二轮问题"},
+			{Role: "assistant", Content: "第二轮回答"},
+		}})
+	if res.IsNew {
+		t.Fatal("conversational suffix resume must reuse the session")
+	}
+	if res.ConversationID != "conv-taskA" {
+		t.Fatalf("unexpected conversation %s", res.ConversationID)
+	}
+
+	// The completed turn re-binds history (as bindConversation does in the
+	// real flow), then the following turn with the assistant reply included
+	// continues through the normal prefix path.
+	sr.Bind("", "conv-taskA", "acc1",
+		&oaiReq{Messages: []oaiMsg{
+			{Role: "user", Content: "第二轮问题"},
+			{Role: "assistant", Content: "第二轮回答"},
+		}},
+		"第三轮回答",
+		resolverTestRequest("203.0.113.10", "client-a", "alice"))
+	res2 := sr.Resolve(resolverTestRequest("203.0.113.10", "client-a", "alice"),
+		&oaiReq{Messages: []oaiMsg{
+			{Role: "user", Content: "第二轮问题"},
+			{Role: "assistant", Content: "第二轮回答"},
+			{Role: "assistant", Content: "第三轮回答"},
+			{Role: "user", Content: "继续"},
+		}})
+	if res2.IsNew {
+		t.Fatal("post-resume turn must reuse the session")
+	}
+	if res2.ConversationID != "conv-taskA" {
+		t.Fatalf("unexpected conversation %s after resume", res2.ConversationID)
+	}
+}
+
 func TestResolverIncrementalBoundary(t *testing.T) {
 	t.Setenv("M365_SESSION_CACHE", filepath.Join(t.TempDir(), "sessions.json"))
 	sr := openSessionResolver()

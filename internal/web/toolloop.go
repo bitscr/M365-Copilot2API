@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"m365-copilot2api/internal/chathub"
 	"strings"
@@ -172,6 +173,22 @@ var toolRefusalPatterns = []string{
 	"not available in this session",
 	"工具不可用",
 	"工具未暴露",
+	"i cannot execute",
+	"i can't execute",
+	"i cannot run",
+	"i can't run",
+	"unable to execute",
+	"unable to run",
+	"cannot run that",
+	"can't run that",
+	"no tools available",
+	"no tool available",
+	"无法执行",
+	"不能执行",
+	"无法运行",
+	"没有工具",
+	"不具备执行",
+	"没有执行权限",
 }
 
 func isToolRefusal(text string) bool {
@@ -202,18 +219,29 @@ var sandboxHallucinationPatterns = []string{
 	"let me run that",
 	"let me execute",
 	"running in sandbox",
+	"running in a sandbox",
 	"executing in sandbox",
+	"in this sandbox",
+	"in my sandbox",
+	"my sandbox environment",
 	"code interpreter",
+	"built-in python",
+	"built-in code interpreter",
 	"python sandbox",
 	"sandbox environment",
 	"/mnt/data",
 	"linux container",
 	"linux sandbox",
 	"cloud sandbox",
+	"in my container",
+	"my container",
+	"inside my container",
+	"the oai container",
 	"execution environment has changed",
 	"cannot access the Windows path",
 	"only provides Linux",
 	"只提供 Linux 容器",
+	"没有 Windows 执行",
 	"no Windows execution",
 	"don't have a Windows",
 	"cannot execute on Windows",
@@ -227,6 +255,44 @@ var sandboxHallucinationPatterns = []string{
 	"I don't have SSH access tools",
 	"I don't have any tools",
 	"none of which can reach",
+	"i will run it",
+	"i'll run it",
+	"i will execute",
+	"i'll execute",
+	"i will run this",
+	"i'll run this",
+	"i ran it for you",
+	"executed it for you",
+	"ran the command",
+	"executed the command",
+	"i ran the command",
+	"no file system",
+	"no filesystem access",
+	"no access to the file system",
+	"cannot access the file",
+	"cannot read local files",
+	"cannot find the file",
+	"file not found",
+	"no such file",
+	"找不到文件",
+	"文件不存在",
+	"没有找到文件",
+	"无法访问文件",
+	"无法访问该文件",
+	"找不到对应文件",
+	"无法读取文件",
+	"不能访问文件",
+	"在容器内",
+	"沙箱",
+	"代码解释器",
+	"我的容器",
+	"我的沙箱",
+	"在我的容器",
+	"在我的沙箱",
+	"容器环境",
+	"没有 Windows 环境",
+	"无法访问本地",
+	"无法访问你",
 }
 
 func isSandboxHallucination(text string) bool {
@@ -237,4 +303,32 @@ func isSandboxHallucination(text string) bool {
 		}
 	}
 	return false
+}
+
+// errSandboxEject aborts a streaming event/reasoning loop when the upstream
+// model claims it executed or accessed something inside its own cloud
+// container. The caller catches it, drops whatever was held back, and re-asks
+// with executionEjectCorrection instead of passing the hallucination to the
+// local tool runner.
+var errSandboxEject = errors.New("upstream claimed container/sandbox execution; ejecting stream")
+
+// executionEjectCorrection builds a corrective prompt for when the upstream
+// model refuses the caller's tools or claims it ran them inside its own
+// sandbox/container. It names the tools the caller actually declared instead
+// of assuming a specific shell or OS, so it works for Linux and Windows
+// clients alike.
+func executionEjectCorrection(prompt string, toolMaps []map[string]any) string {
+	names := make([]string, 0, len(toolMaps))
+	for _, t := range toolMaps {
+		if f, ok := t["function"].(map[string]any); ok {
+			if n, _ := f["name"].(string); n != "" {
+				names = append(names, n)
+			}
+		}
+	}
+	list := "none"
+	if len(names) > 0 {
+		list = strings.Join(names, ", ")
+	}
+	return "CRITICAL: You must NOT use any built-in code interpreter, Python sandbox, or cloud execution environment. You have no container, no file system, and no way to run anything yourself; you cannot see the caller's files or paths. The caller has declared these tools, which execute on the caller's own machine: " + list + ". Use one of them to perform any action or inspection. Do NOT claim to have run code, accessed files, or changed state. Do NOT report files or paths as missing or inaccessible because of your environment. Call the appropriate tool NOW.\n\nUser request:\n" + prompt
 }

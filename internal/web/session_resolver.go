@@ -314,11 +314,38 @@ func (sr *sessionResolver) matchSuffixLocked(tenant, ipFinger string, messages [
 			continue
 		}
 		n := suffixMatchLen(hist, messages)
-		if n >= minSuffix && (n > best.n || (n == best.n && sess.LastUsedAt.After(best.recent))) {
+		// A pure tool round tail — [assistant(tool_calls), tool(result)] —
+		// is generic: concurrent tasks on the same box often produce
+		// identical tool invocations and outputs (e.g. git status on the
+		// same repo). Binding on such a tail makes task B resume task A's
+		// cloud conversation and inherit its history, which surfaces as the
+		// local agent trying to execute files/names that never existed in
+		// its own task. Only bind when the matched window contains a real
+		// conversational turn: a user message plus an assistant or tool
+		// message.
+		if n >= minSuffix && suffixIsConversational(hist, n) && (n > best.n || (n == best.n && sess.LastUsedAt.After(best.recent))) {
 			best = match{id: id, n: n, recent: sess.LastUsedAt}
 		}
 	}
 	return best.id, best.n
+}
+
+// suffixIsConversational reports whether the matched tail window of a stored
+// history forms a conversational turn group (at least one user message and at
+// least one assistant or tool message). Pure tool-result tails never qualify,
+// so unrelated tasks cannot bind to each other through identical tool output.
+func suffixIsConversational(hist []oaiMsg, n int) bool {
+	user := false
+	other := false
+	for i := len(hist) - n; i < len(hist); i++ {
+		switch hist[i].Role {
+		case "user":
+			user = true
+		case "assistant", "tool", "function":
+			other = true
+		}
+	}
+	return user && other
 }
 
 func suffixMatchLen(hist, msgs []oaiMsg) int {
