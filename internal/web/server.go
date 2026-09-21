@@ -2145,46 +2145,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, errSandboxEject) && ejected {
 			// The upstream claimed it ran the tool in its own container
 			// instead of returning a call for the caller's machine. Drop the
-			// held text, re-ask with the execution-boundary correction, and
-			// forward the corrected response (tool call or clean text).
+			// held text, re-ask with escalating corrections, and forward the
+			// corrected response (tool call, honest refusal, or clean text).
 			log.Printf("[sandbox-eject] id=%s upstream claimed container execution mid-stream; dropping held text and re-asking with correction", requestID)
-			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: ejectCorrectionFor(prompt, toolMaps), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
-			if retryErr == nil {
-				calls, _ := validateCalls("sandbox-eject", fencedToolCalls(retryRes.Text, toolMaps, body.ToolChoice))
-				if len(calls) == 0 {
-					if parsed, ok := parseModelToolDecision(retryRes.Text, toolMaps, body.ToolChoice); ok {
-						calls, _ = validateCalls("sandbox-eject-parse", parsed)
-					}
-				}
-				if len(calls) > 0 {
-					calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-					if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
-						calls = calls[:1]
-					}
-					_ = writeToolResponse(w, id, model, true, body.shouldSendStreamUsage(), calls, retryRes)
-					if body.User != "" && retryRes.ConversationID != "" {
-						s.userSessions.Put(tenantFromRequest(r), body.User, retryRes.ConversationID, retryRes.SessionID, acc.ID)
-					}
-					s.bindConversation(acc, &body, r, retryRes, answerPrompt, startedAt)
-					s.storeConvCache(tenant, acc.ID, convCacheModel, retryRes, tone, body.Messages, convReused)
-					return
-				}
-				if !isSandboxHallucination(retryRes.Text) && !isToolRefusal(retryRes.Text) {
-					// Clean corrected answer: stream it as the response.
-					res = retryRes
-					text.Reset()
-					text.WriteString(retryRes.Text)
-					if emitErr := emitText(retryRes.Text); emitErr != nil {
-						return
-					}
-					err = nil
-				} else {
-					log.Printf("[sandbox-eject] id=%s upstream kept claiming container execution after correction", requestID)
-					_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "upstream repeatedly claimed sandbox/container execution instead of returning a tool call", "code": "upstream_error"}})+"\n\n")
-					_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
-					return
-				}
-			} else {
+			retryRes, retryErr := s.retryEjectedStream(ctx, acc.ID, account, prompt, tone, &body, toolCfg, toolMaps)
+			if retryErr != nil {
 				log.Printf("[sandbox-eject] id=%s correction retry failed: %v", requestID, retryErr)
 				code, msg := actionableUpstreamError(retryErr)
 				msg = sanitizePublicInternalText(msg)
@@ -2192,6 +2157,43 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 				return
 			}
+			if executionEjectTrigger(retryRes.Text, toolMaps) {
+				log.Printf("[sandbox-eject] id=%s upstream kept claiming container execution after correction retries", requestID)
+				msg := "upstream repeatedly claimed sandbox/container execution instead of returning a tool call"
+				if len(toolMaps) == 0 {
+					msg = "upstream repeatedly claimed it executed commands and reported container output; refusing to relay fabricated results"
+				}
+				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "upstream_error"}})+"\n\n")
+				_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
+				return
+			}
+			calls, _ := validateCalls("sandbox-eject", fencedToolCalls(retryRes.Text, toolMaps, body.ToolChoice))
+			if len(calls) == 0 {
+				if parsed, ok := parseModelToolDecision(retryRes.Text, toolMaps, body.ToolChoice); ok {
+					calls, _ = validateCalls("sandbox-eject-parse", parsed)
+				}
+			}
+			if len(calls) > 0 {
+				calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
+				if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
+					calls = calls[:1]
+				}
+				_ = writeToolResponse(w, id, model, true, body.shouldSendStreamUsage(), calls, retryRes)
+				if body.User != "" && retryRes.ConversationID != "" {
+					s.userSessions.Put(tenantFromRequest(r), body.User, retryRes.ConversationID, retryRes.SessionID, acc.ID)
+				}
+				s.bindConversation(acc, &body, r, retryRes, answerPrompt, startedAt)
+				s.storeConvCache(tenant, acc.ID, convCacheModel, retryRes, tone, body.Messages, convReused)
+				return
+			}
+			// Clean corrected answer (text or honest refusal): stream it.
+			res = retryRes
+			text.Reset()
+			text.WriteString(retryRes.Text)
+			if emitErr := emitText(retryRes.Text); emitErr != nil {
+				return
+			}
+			err = nil
 		}
 		if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
 			originalErr := err
@@ -2547,40 +2549,8 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			// upstream claimed container/sandbox execution instead of
 			// returning a call for the caller's machine.
 			log.Printf("[sandbox-eject] id=%s reasoning stream claimed container execution; re-asking with correction", requestID)
-			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: ejectCorrectionFor(prompt, toolMaps), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
-			if retryErr == nil {
-				calls, _ := validateCalls("sandbox-eject-r", fencedToolCalls(retryRes.Text, toolMaps, body.ToolChoice))
-				if len(calls) == 0 {
-					if parsed, ok := parseModelToolDecision(retryRes.Text, toolMaps, body.ToolChoice); ok {
-						calls, _ = validateCalls("sandbox-eject-r-parse", parsed)
-					}
-				}
-				if len(calls) > 0 {
-					calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-					if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
-						calls = calls[:1]
-					}
-					_ = writeToolResponse(w, id, model, true, body.shouldSendStreamUsage(), calls, retryRes)
-					if body.User != "" && retryRes.ConversationID != "" {
-						s.userSessions.Put(tenantFromRequest(r), body.User, retryRes.ConversationID, retryRes.SessionID, acc.ID)
-					}
-					s.bindConversation(acc, &body, r, retryRes, answerPrompt, startedAt)
-					s.storeConvCache(tenant, acc.ID, convCacheModel, retryRes, tone, body.Messages, convReused)
-					return
-				}
-				if !isSandboxHallucination(retryRes.Text) && !isToolRefusal(retryRes.Text) {
-					res = retryRes
-					if writeErr := onDelta(retryRes.Text); writeErr != nil {
-						return
-					}
-					err = nil
-				} else {
-					log.Printf("[sandbox-eject] id=%s upstream kept claiming container execution after correction", requestID)
-					_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "upstream repeatedly claimed sandbox/container execution instead of returning a tool call", "code": "upstream_error"}})+"\n\n")
-					_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
-					return
-				}
-			} else {
+			retryRes, retryErr := s.retryEjectedStream(ctx, acc.ID, account, prompt, tone, &body, toolCfg, toolMaps)
+			if retryErr != nil {
 				log.Printf("[sandbox-eject] id=%s correction retry failed: %v", requestID, retryErr)
 				code, msg := actionableUpstreamError(retryErr)
 				msg = sanitizePublicInternalText(msg)
@@ -2588,6 +2558,41 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 				return
 			}
+			if executionEjectTrigger(retryRes.Text, toolMaps) {
+				log.Printf("[sandbox-eject] id=%s upstream kept claiming container execution after correction retries", requestID)
+				msg := "upstream repeatedly claimed sandbox/container execution instead of returning a tool call"
+				if len(toolMaps) == 0 {
+					msg = "upstream repeatedly claimed it executed commands and reported container output; refusing to relay fabricated results"
+				}
+				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "upstream_error"}})+"\n\n")
+				_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
+				return
+			}
+			calls, _ := validateCalls("sandbox-eject-r", fencedToolCalls(retryRes.Text, toolMaps, body.ToolChoice))
+			if len(calls) == 0 {
+				if parsed, ok := parseModelToolDecision(retryRes.Text, toolMaps, body.ToolChoice); ok {
+					calls, _ = validateCalls("sandbox-eject-r-parse", parsed)
+				}
+			}
+			if len(calls) > 0 {
+				calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
+				if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
+					calls = calls[:1]
+				}
+				_ = writeToolResponse(w, id, model, true, body.shouldSendStreamUsage(), calls, retryRes)
+				if body.User != "" && retryRes.ConversationID != "" {
+					s.userSessions.Put(tenantFromRequest(r), body.User, retryRes.ConversationID, retryRes.SessionID, acc.ID)
+				}
+				s.bindConversation(acc, &body, r, retryRes, answerPrompt, startedAt)
+				s.storeConvCache(tenant, acc.ID, convCacheModel, retryRes, tone, body.Messages, convReused)
+				return
+			}
+			// Clean corrected answer (text or honest refusal): stream it.
+			res = retryRes
+			if writeErr := onDelta(retryRes.Text); writeErr != nil {
+				return
+			}
+			err = nil
 		}
 		if err != nil && streamedReasoningLen == 0 && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
 			originalErr := err

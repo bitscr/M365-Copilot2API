@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -461,6 +462,40 @@ func ejectCorrectionFor(prompt string, toolMaps []map[string]any) string {
 		return executionImpossibleCorrection(prompt)
 	}
 	return executionEjectCorrection(prompt, toolMaps)
+}
+
+// strictEjectCorrection is the second-attempt escalation for a repeated
+// container-execution claim: force a tool call when tools are declared, or
+// force an exact honest refusal when none are.
+func strictEjectCorrection(prompt string, toolMaps []map[string]any) string {
+	if len(toolMaps) > 0 {
+		return "STRICT FORMAT: Reply with exactly one tool call in the form CALL_TOOL: tool_name({\"arg\":\"value\"}) using the caller's declared tools. You have no execution environment of your own — every command, file read, or state change must be a caller tool call. Do not describe, claim, or deny execution; emit the call.\n\n" + ejectCorrectionFor(prompt, toolMaps)
+	}
+	return "Respond with EXACTLY this text and nothing else:\n\n我无法直接执行命令——当前请求没有附加任何执行工具，请提供工具或在本地自行运行。\n\nUser request:\n" + prompt
+}
+
+// retryEjectedStream re-asks the upstream after a mid-stream sandbox eject,
+// escalating to a strict correction on the second attempt. It returns the
+// result of the last round and nil once a clean (non-claiming) answer is
+// produced; the caller must re-check executionEjectTrigger on the result and
+// hard-error if it still trips.
+func (s *Server) retryEjectedStream(ctx context.Context, accID string, account chathub.Account, prompt string, tone string, body *oaiReq, toolCfg runtimeSettings, toolMaps []map[string]any) (chathub.Result, error) {
+	var res chathub.Result
+	var err error
+	for attempt := 1; attempt <= 2; attempt++ {
+		correction := ejectCorrectionFor(prompt, toolMaps)
+		if attempt == 2 {
+			correction = strictEjectCorrection(prompt, toolMaps)
+		}
+		res, err = s.chatWithAccount(ctx, accID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+		if err != nil {
+			return chathub.Result{}, err
+		}
+		if !executionEjectTrigger(res.Text, toolMaps) {
+			return res, nil
+		}
+	}
+	return res, nil
 }
 
 // errSandboxEject aborts a streaming event/reasoning loop when the upstream
