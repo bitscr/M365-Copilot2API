@@ -77,3 +77,72 @@ func TestExecutionEjectCorrectionNamesDeclaredTools(t *testing.T) {
 		}
 	}
 }
+
+// TestSandboxClaimDetectsReproducedProbe is the regression test for the
+// plain-text probe leak: the exact container-hallucination response captured
+// from the field (current dir /mnt/data, fake node version, missing
+// /opt/browser-panel) must trip the no-tools eject.
+func TestSandboxClaimDetectsReproducedProbe(t *testing.T) {
+	field := "我在当前运行环境中执行了你要求的命令，结果如下：\n\n当前目录：/mnt/data\nNode.js：v24.16.0\n/opt/browser-panel：不存在\n/opt/browser-panel/data/app.db：不存在\n因此我已停止，没有在这个环境中写入 anyrouter.js，也没有创建或修改 Browser Automation 任务。"
+	if !isSandboxClaim(field) {
+		t.Fatal("reproduced sandbox probe claim must be detected")
+	}
+	if !executionEjectTrigger(field, nil) {
+		t.Fatal("no-tools trigger must fire on the reproduced probe claim")
+	}
+}
+
+// TestSandboxClaimIgnoresBenignContainerTalk verifies the claim gate does not
+// eject ordinary answers that merely mention containers or paths.
+func TestSandboxClaimIgnoresBenignContainerTalk(t *testing.T) {
+	benign := []string{
+		"/mnt/data 是容器内用于持久化数据的挂载目录，通常在 Docker 部署中使用。",
+		"The /mnt/data mount is where the container stores uploaded files.",
+		"Kubernetes 部署时建议把 /opt/browser-panel 挂载为持久卷。",
+		"how the linux sandbox works",
+	}
+	for _, c := range benign {
+		if isSandboxClaim(c) {
+			t.Errorf("benign container mention falsely ejected: %q", c)
+		}
+		if executionEjectTrigger(c, nil) {
+			t.Errorf("benign container mention falsely ejected via trigger: %q", c)
+		}
+	}
+}
+
+// TestExecutionIntent covers the no-tools arming trigger.
+func TestExecutionIntent(t *testing.T) {
+	yes := []string{
+		"请执行 pwd 和 node --version",
+		"帮我跑一下 ls /opt/browser-panel",
+		"检查本机环境并输出当前目录",
+		"run the command and show me the output",
+	}
+	for _, c := range yes {
+		if !executionIntent(c) {
+			t.Errorf("execution intent not detected: %q", c)
+		}
+	}
+	no := []string{"你好", "总结一下这篇文章", "what is the weather like"}
+	for _, c := range no {
+		if executionIntent(c) {
+			t.Errorf("false execution intent: %q", c)
+		}
+	}
+}
+
+// TestEjectCorrectionForPicksPerTools verifies the correction selection: a
+// declared tool gets the execution-boundary correction with tool names; no
+// tools gets the no-execution-capability correction.
+func TestEjectCorrectionForPicksPerTools(t *testing.T) {
+	tools := []map[string]any{
+		{"type": "function", "function": map[string]any{"name": "bash"}},
+	}
+	if c := ejectCorrectionFor("probe", tools); !strings.Contains(c, "bash") || !strings.Contains(c, "caller's own machine") {
+		t.Errorf("tooled correction wrong: %.120s", c)
+	}
+	if c := ejectCorrectionFor("probe", nil); !strings.Contains(c, "no execution channel") || strings.Contains(c, "caller's own machine") {
+		t.Errorf("no-tool correction wrong: %.120s", c)
+	}
+}

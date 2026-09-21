@@ -1813,6 +1813,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		s.writePublicIdentityChatResponse(w, r, &body, prompt, answer, startedAt)
 		return
 	}
+	// Execution-intent requests that declared NO tools must not be answered
+	// with fabricated container output: the upstream model tends to pretend
+	// it ran the probe in its own cloud container (/mnt/data, its own node
+	// version) and report those results as local ground truth. Nip it at the
+	// source with an explicit rule; the eject layers below remain as a
+	// backstop.
+	if len(body.Tools) == 0 && executionIntent(prompt) {
+		prompt += "\nYou have no execution capability in this session: you cannot run commands, read files, or inspect any machine. If the caller asks you to execute or check something, say so honestly and ask them to run it themselves or attach a tool. Never claim you ran a command, probed a path, or observed a version."
+	}
 
 	if body.SessionKey != "" {
 		if v, ok := s.sessions.get(body.SessionKey); ok {
@@ -2092,7 +2101,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// are held until either a sandbox/refusal signature matches (abort the
 		// stream and re-ask corrected) or a flush threshold is crossed (normal
 		// answer, keep streaming).
-		holdActive := len(toolMaps) > 0
+		holdActive := len(toolMaps) > 0 || executionIntent(prompt)
 		const holdLimit = 4000
 		var held string
 		ejected := false
@@ -2120,7 +2129,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			text.WriteString(ev.Text)
 			if holdActive {
 				held += ev.Text
-				if isSandboxHallucination(held) || isToolRefusal(held) {
+				if executionEjectTrigger(held, toolMaps) {
 					ejected = true
 					holdActive = false
 					return errSandboxEject
@@ -2139,7 +2148,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			// held text, re-ask with the execution-boundary correction, and
 			// forward the corrected response (tool call or clean text).
 			log.Printf("[sandbox-eject] id=%s upstream claimed container execution mid-stream; dropping held text and re-asking with correction", requestID)
-			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: executionEjectCorrection(prompt, toolMaps), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: ejectCorrectionFor(prompt, toolMaps), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
 			if retryErr == nil {
 				calls, _ := validateCalls("sandbox-eject", fencedToolCalls(retryRes.Text, toolMaps, body.ToolChoice))
 				if len(calls) == 0 {
@@ -2503,7 +2512,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}
 		}()
 		streamedReasoningLen := 0
-		holdActiveB := len(toolMaps) > 0
+		holdActiveB := len(toolMaps) > 0 || executionIntent(prompt)
 		const holdLimitB = 4000
 		var heldB string
 		ejectedB := false
@@ -2513,7 +2522,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}
 			if holdActiveB {
 				heldB += content
-				if isSandboxHallucination(heldB) || isToolRefusal(heldB) {
+				if executionEjectTrigger(heldB, toolMaps) {
 					ejectedB = true
 					holdActiveB = false
 					return errSandboxEject
@@ -2538,7 +2547,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			// upstream claimed container/sandbox execution instead of
 			// returning a call for the caller's machine.
 			log.Printf("[sandbox-eject] id=%s reasoning stream claimed container execution; re-asking with correction", requestID)
-			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: executionEjectCorrection(prompt, toolMaps), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: ejectCorrectionFor(prompt, toolMaps), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
 			if retryErr == nil {
 				calls, _ := validateCalls("sandbox-eject-r", fencedToolCalls(retryRes.Text, toolMaps, body.ToolChoice))
 				if len(calls) == 0 {
@@ -2767,16 +2776,22 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		model = "m365-copilot"
 	}
 	id := "chatcmpl-" + uuid.NewString()
-	if len(toolMaps) > 0 && (isToolRefusal(res.Text) || isSandboxHallucination(res.Text)) {
+	if executionEjectTrigger(res.Text, toolMaps) {
 		// The upstream model either denied the caller's tools or claimed it
 		// executed them inside its own cloud container (where the caller's
-		// files do not exist — the "file not found" symptoms). Retry with an
-		// escalating correction that names the actual declared tools, and
-		// never leak the hallucinated answer to the client if retries fail.
-		log.Printf("[tool-eject] id=%s model refused tools or claimed container execution, retrying with correction", requestID)
+		// files do not exist — the "file not found" symptoms). This also
+		// fires for requests that declared NO tools: a plain-text probe must
+		// not be answered with fake container output ("current dir /mnt/data,
+		// node v24.16.0") as if it were local ground truth. Retry with an
+		// escalating correction, and never leak the hallucinated answer to
+		// the client if retries fail.
+		correction := executionEjectCorrection(prompt, toolMaps)
+		if len(toolMaps) == 0 {
+			correction = executionImpossibleCorrection(prompt)
+		}
+		log.Printf("[tool-eject] id=%s model refused tools or claimed container execution (tools=%d), retrying with correction", requestID, len(toolMaps))
 		for attempt := 1; attempt <= 2; attempt++ {
-			correction := executionEjectCorrection(prompt, toolMaps)
-			if attempt == 2 {
+			if attempt == 2 && len(toolMaps) > 0 {
 				correction = "STRICT FORMAT: Reply with exactly one tool call in the form CALL_TOOL: tool_name({\"arg\":\"value\"}) using the caller's declared tools. You have no execution environment of your own — every command, file read, or state change must be a caller tool call. Do not describe, claim, or deny execution; emit the call.\n\n" + correction
 			}
 			res2, err2 := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
@@ -2784,13 +2799,17 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				break
 			}
 			res = res2
-			if !isToolRefusal(res2.Text) && !isSandboxHallucination(res2.Text) {
+			if !executionEjectTrigger(res2.Text, toolMaps) {
 				break
 			}
 		}
-		if isToolRefusal(res.Text) || isSandboxHallucination(res.Text) {
+		if executionEjectTrigger(res.Text, toolMaps) {
 			log.Printf("[tool-eject] id=%s upstream kept refusing tools / claiming container execution after retries", requestID)
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream refused to use the caller's declared tools and claimed execution in its own container instead; no tool call was produced. Retry or check the upstream model's tool support.")
+			msg := "upstream refused to use the caller's declared tools and claimed execution in its own container instead; no tool call was produced. Retry or check the upstream model's tool support."
+			if len(toolMaps) == 0 {
+				msg = "upstream claimed it executed commands and reported container output although no execution tool was attached; refusing to relay fabricated results. Retry with a declared tool or ask the caller to run commands locally."
+			}
+			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", msg)
 			return
 		}
 	}

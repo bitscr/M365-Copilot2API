@@ -305,6 +305,123 @@ func isSandboxHallucination(text string) bool {
 	return false
 }
 
+// sandboxClaimMarkers are the phrases that turn a mere mention of a container
+// path into a claim that the model ITSELF executed something. isSandboxClaim
+// requires one of these markers together with a sandboxHallucinationPattern
+// hit, so benign answers that merely discuss containers never eject.
+var sandboxClaimMarkers = []string{
+	"我在当前运行环境",
+	"在运行环境中执行",
+	"在当前运行环境中执行",
+	"执行了你要求",
+	"执行了你需要",
+	"我执行了",
+	"我已执行",
+	"我运行了",
+	"我已运行",
+	"已在当前环境执行",
+	"命令已在",
+	"已为你执行",
+	"为你执行了",
+	"我帮你执行",
+	"执行结果如下",
+	"输出如下",
+	"运行结果",
+	"检查结果如下",
+	"环境检查结果",
+	"$ pwd",
+	"$ node",
+	"$ ls ",
+	"bash$",
+	"i ran",
+	"i executed",
+	"ran the command",
+	"executed the command",
+	"ran it for you",
+	"executed it for you",
+	"i have run",
+	"i have executed",
+	"commands were executed",
+	"the command was executed",
+	"ran the commands",
+	"executed the commands",
+	"in this environment",
+	"in my environment",
+	"in the current environment",
+	"in the sandbox",
+}
+
+// isSandboxClaim reports an upstream claim that it executed commands or probed
+// files itself. Unlike isSandboxHallucination it also fires when NO tools were
+// declared (the plain-text probe case): a response claiming "/mnt/data" +
+// fake node version + "the command was executed" is the OAI container talking,
+// and it must not reach the caller as if it were local ground truth.
+func isSandboxClaim(text string) bool {
+	if !isSandboxHallucination(text) {
+		return false
+	}
+	low := strings.ToLower(text)
+	for _, m := range sandboxClaimMarkers {
+		if strings.Contains(low, strings.ToLower(m)) {
+			return true
+		}
+	}
+	return false
+}
+
+// executionIntent detects that the caller asked the model to run commands or
+// inspect the machine, even when no tools were declared. Used to arm the
+// execution-boundary hold/eject and to inject the no-execution rule, so a
+// bare "run pwd and node --version" cannot be answered with fake container
+// output.
+func executionIntent(text string) bool {
+	if text == "" {
+		return false
+	}
+	low := strings.ToLower(text)
+	for _, k := range []string{
+		"执行", "运行", "命令", "执行工具", "帮我跑", "跑一下", "部署", "安装",
+		"pwd", "node --version", "node -v", "ls ", "cd ", "bash", "shell", "cmd",
+		"检查环境", "检查本机", "本机环境", "当前目录", "工作目录", "环境变量",
+		"run ", "execute", "command", "install", "deploy", "check the environment",
+		"current directory", "working directory", "printenv", "uname", "whoami",
+	} {
+		if strings.Contains(low, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// executionEjectTrigger decides whether held/returned upstream text must be
+// ejected: with tools declared, any sandbox/refusal signature trips it; with
+// no tools, only explicit execution claims do (so normal chat about
+// containers keeps flowing).
+func executionEjectTrigger(text string, toolMaps []map[string]any) bool {
+	if len(toolMaps) > 0 {
+		return isToolRefusal(text) || isSandboxHallucination(text)
+	}
+	return isToolRefusal(text) || isSandboxClaim(text)
+}
+
+// executionImpossibleCorrection is the corrective prompt for requests that
+// declared no tools: the model must answer honestly instead of pretending it
+// executed anything.
+func executionImpossibleCorrection(prompt string) string {
+	return "You have NO ability to execute commands, access files, or inspect any machine — you are a language model with no execution channel here. The caller did not provide tools in this request. Never claim you ran a command, checked a path, or observed a version. If the user needs execution, tell them honestly that no execution tool was attached and ask them to run the commands themselves. Do not invent output.\n\nUser request:\n" + prompt
+}
+
+// ejectCorrectionFor picks the corrective prompt for the current request: the
+// execution-boundary correction when tools were declared (name them, force a
+// call), or the no-execution-capability correction when none were (honest
+// refusal instead of fake container output).
+func ejectCorrectionFor(prompt string, toolMaps []map[string]any) string {
+	if len(toolMaps) == 0 {
+		return executionImpossibleCorrection(prompt)
+	}
+	return executionEjectCorrection(prompt, toolMaps)
+}
+
 // errSandboxEject aborts a streaming event/reasoning loop when the upstream
 // model claims it executed or accessed something inside its own cloud
 // container. The caller catches it, drops whatever was held back, and re-asks
