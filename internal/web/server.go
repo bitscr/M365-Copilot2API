@@ -360,6 +360,8 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/admin/deployment/check", s.deploymentCheck)
 	m.HandleFunc("/api/admin/debug/logs", s.debugList)
 	m.HandleFunc("/api/admin/debug/detail", s.debugDetail)
+	m.HandleFunc("/api/admin/syslogs", s.handleSysLogs)
+	m.HandleFunc("/api/admin/syslogs/clear", s.handleSysLogsClear)
 	m.HandleFunc("/api/admin/export", s.adminExportBackup)
 	m.HandleFunc("/api/admin/import", s.adminImportBackup)
 	m.HandleFunc("/api/health", s.health)
@@ -1143,52 +1145,39 @@ func (s *Server) callbackPKCE(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
-	if accountID == "" {
-		// Failover mode: prefer the last healthy account, only rotate on failure
-		s.mu.Lock()
-		preferred := s.lastHealthyAccount
-		s.mu.Unlock()
-		if preferred != "" && s.accountAvailable(preferred) && s.accountPool.Available(preferred) && s.accountConcurrency.Available(preferred) {
-			if acc, err := s.tokens.EnsureValid(preferred); err == nil {
-				accountID = preferred
-				return acc, nil
-			}
+	if accountID != "" {
+		result, err := s.tokens.EnsureValid(accountID)
+		if err == nil {
+			s.mu.Lock()
+			s.lastHealthyAccount = accountID
+			s.mu.Unlock()
 		}
-		// No preferred account or it's unavailable; fall back to round-robin
+		return result, err
+	}
+
+	// Multi-account load balancing mode: round-robin through enabled & available accounts
+	for i := 0; i < maxAccountProbe; i++ {
 		acc, ok := s.tokens.Next()
 		if !ok {
 			return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
 		}
-		accountID = acc.ID
-		for i := 0; !s.accountAvailable(accountID) && i < maxAccountProbe; i++ {
-			acc, ok = s.tokens.Next()
-			if !ok {
-				break
+		if s.accountAvailable(acc.ID) {
+			result, err := s.tokens.EnsureValid(acc.ID)
+			if err == nil {
+				s.mu.Lock()
+				s.lastHealthyAccount = acc.ID
+				s.mu.Unlock()
+				return result, nil
 			}
-			accountID = acc.ID
-		}
-		if !s.tokens.ScheduleEnabled(accountID) {
-			return auth.AccountToken{}, fmt.Errorf("no accounts enabled for scheduling")
-		}
-		if !s.accountPool.Available(accountID) {
-			until := s.accountPool.EarliestRecovery()
-			retry := int(time.Until(until).Seconds())
-			if retry < 5 {
-				retry = 5
-			}
-			return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: retry, Body: "all accounts are cooling down; try again later"}
-		}
-		if !s.accountConcurrency.Available(accountID) {
-			return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: 1, Body: "all accounts are at their concurrency limit; try again shortly"}
 		}
 	}
-	result, err := s.tokens.EnsureValid(accountID)
-	if err == nil {
-		s.mu.Lock()
-		s.lastHealthyAccount = accountID
-		s.mu.Unlock()
+
+	until := s.accountPool.EarliestRecovery()
+	retry := int(time.Until(until).Seconds())
+	if retry < 5 {
+		retry = 5
 	}
-	return result, err
+	return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: retry, Body: "all accounts are cooling down or unavailable; try again later"}
 }
 
 // nextHealthyAccount returns the next round-robin account that is still
@@ -1211,7 +1200,53 @@ func (s *Server) nextHealthyAccount(avoidID string) (auth.AccountToken, error) {
 	return auth.AccountToken{}, fmt.Errorf("no healthy account available for failover")
 }
 
+func (s *Server) resolveImageAccount(accountID string) (auth.AccountToken, error) {
+	if accountID != "" {
+		result, err := s.tokens.EnsureValid(accountID)
+		if err == nil {
+			s.mu.Lock()
+			s.lastHealthyAccount = accountID
+			s.mu.Unlock()
+		}
+		return result, err
+	}
+	for i := 0; i < maxAccountProbe; i++ {
+		acc, ok := s.tokens.Next()
+		if !ok {
+			return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
+		}
+		if s.accountAvailable(acc.ID) && (s.accountPool == nil || s.accountPool.ImageGenAvailable(acc.ID)) {
+			result, err := s.tokens.EnsureValid(acc.ID)
+			if err == nil {
+				s.mu.Lock()
+				s.lastHealthyAccount = acc.ID
+				s.mu.Unlock()
+				return result, nil
+			}
+		}
+	}
+	return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: 60, Body: "all accounts are cooling down or image quota exhausted; try again later"}
+}
+
+func (s *Server) nextHealthyImageAccount(avoidID string) (auth.AccountToken, error) {
+	for i := 0; i < maxAccountProbe; i++ {
+		acc, ok := s.tokens.Next()
+		if !ok {
+			return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
+		}
+		if avoidID != "" && acc.ID == avoidID {
+			continue
+		}
+		if !s.accountAvailable(acc.ID) || (s.accountPool != nil && !s.accountPool.ImageGenAvailable(acc.ID)) {
+			continue
+		}
+		return s.tokens.EnsureValid(acc.ID)
+	}
+	return auth.AccountToken{}, fmt.Errorf("no healthy image account available for failover")
+}
+
 type chatBody struct {
+	Model                 string                   `json:"model,omitempty"`
 	AccountID             string                   `json:"accountId"`
 	Message               string                   `json:"message"`
 	Prompt                string                   `json:"prompt"`
@@ -1238,8 +1273,19 @@ type responseFormat struct {
 	JSONSchema map[string]any `json:"json_schema,omitempty"`
 }
 
+func isImageModel(model string) bool {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "gpt-image-2", "image-2", "dall-e-3", "dall-e-2", "designer":
+		return true
+	default:
+		return false
+	}
+}
+
 func modelTone(model string) string {
 	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "gpt-image-2", "image-2", "dall-e-3", "dall-e-2", "designer":
+		return "Magic"
 	case "gpt-5.2":
 		return "Gpt_5_2_Chat"
 	case "gpt-5.2-reasoning":
@@ -1796,7 +1842,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// single message.text field. This keeps system/developer instructions,
 	// history, and the current user turn distinguishable.
 	var prompt string
-	prompt, body.Attachments = flattenPromptMessages(body.Messages, body.Attachments)
+	if isImageModel(body.Model) {
+		prompt, body.Attachments = extractImagePrompt(body.Messages, body.Attachments)
+		body.ConversationID = ""
+		body.SessionID = ""
+		log.Printf("[image-model-isolate] id=%s model=%s extracted_prompt_len=%d", requestID, body.Model, len(prompt))
+	} else {
+		prompt, body.Attachments = flattenPromptMessages(body.Messages, body.Attachments)
+	}
 	log.Printf("[req-trace] id=%s stage=prompt_flattened prompt_len=%d attachments=%d", requestID, len(prompt), len(body.Attachments))
 	fmt.Printf("[multimodal-entry] messages=%d attachments=%d prompt_len=%d\n", len(body.Messages), len(body.Attachments), len(prompt))
 	prompt = strings.TrimSpace(prompt)
@@ -1893,7 +1946,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	accountID := body.AccountID
-	acc, err := s.resolveAccount(accountID)
+	var acc auth.AccountToken
+	if isImageModel(body.Model) {
+		acc, err = s.resolveImageAccount(accountID)
+	} else {
+		acc, err = s.resolveAccount(accountID)
+	}
 	if err != nil {
 		log.Printf("[account-route] resolve failed requested=%q err=%v", accountID, err)
 		writeUpstreamErrorWithAccount(w, err, accountID)
@@ -2244,8 +2302,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			err = nil
 		}
-		if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
+		// Failover must not drag a conversation onto a different account: the
+		// conversation-bound guard stays (conversation empty or resolver-owned),
+		// while image-limit errors and very short streams may still retry on
+		// the next healthy account (image models run conversation-isolated).
+		if err != nil && (text.Len() < 50 || IsImageLimitErr(err)) && len(streamedTools) == 0 && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
 			originalErr := err
+			if IsImageLimitErr(originalErr) && s.accountPool != nil {
+				s.accountPool.MarkImageLimited(acc.ID)
+			}
 			// A throttled stream may retry on the next healthy account: only the
 			// ": connected" preamble reached the client, so the retried stream is
 			// indistinguishable from a fresh request.
@@ -2283,17 +2348,17 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					return emitText(ev.Text)
 				})
 				if err2 == nil {
-					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
+					if IsImageLimitErr(originalErr) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
 					res = res2
 					acc = next
 					err = nil
 				} else {
-					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
+					if IsImageLimitErr(originalErr) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
-					if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
+					if IsImageLimitErr(err2) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(next.ID)
 					}
 					err = err2
@@ -2302,7 +2367,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
-			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
+			if IsImageLimitErr(err) && s.accountPool != nil {
 				s.accountPool.MarkImageLimited(acc.ID)
 			}
 			if convReused {
@@ -2787,6 +2852,54 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		if res.Timestamps.RequestSent != "" {
 			_ = sw2.raw(": m365-metrics " + mustJSON(res.Timestamps) + "\n\n")
 		}
+	} else if isImageModel(body.Model) {
+		currentAcc := acc
+		var currentRes chathub.Result
+		var currentErr error
+		for attempt := 0; attempt < maxAccountProbe; attempt++ {
+			reqCopy := answerReq
+			reqCopy.Tone = "Magic"
+			attemptCtx, attemptCancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ImageTimeoutSeconds)*time.Second)
+			currentRes, currentErr = s.chatWithAccount(attemptCtx, currentAcc.ID, chathub.Account{AccessToken: currentAcc.AccessToken, OID: currentAcc.OID, TID: currentAcc.TID}, reqCopy)
+			attemptCancel()
+			if currentErr == nil {
+				if len(currentRes.Images) == 0 {
+					if urls := extractImageURLs(currentRes.RawResult); len(urls) > 0 {
+						currentRes.Images = urls
+					}
+				}
+				if len(currentRes.Images) == 0 {
+					if urls := extractImageURLs(currentRes.Text); len(urls) > 0 {
+						currentRes.Images = urls
+					}
+				}
+			}
+			if currentErr == nil && len(currentRes.Images) > 0 {
+				res = currentRes
+				acc = currentAcc
+				err = nil
+				break
+			}
+			log.Printf("[image-model-failover] account %s (%s) failed or returned no images (err=%v, images=%d), trying next account...", currentAcc.ID, currentAcc.Email, currentErr, len(currentRes.Images))
+			if s.accountPool != nil && (errors.Is(currentErr, chathub.ErrImageLimit) || isImageLimitNotice(currentRes.Text)) {
+				s.accountPool.MarkImageLimited(currentAcc.ID)
+			}
+			if body.AccountID != "" {
+				res = currentRes
+				acc = currentAcc
+				err = currentErr
+				break
+			}
+			next, nerr := s.nextHealthyImageAccount(currentAcc.ID)
+			if nerr != nil || next.ID == "" {
+				log.Printf("[image-model-failover] no more healthy image accounts available after attempt %d", attempt+1)
+				res = currentRes
+				acc = currentAcc
+				err = currentErr
+				break
+			}
+			currentAcc = next
+		}
 	} else {
 		res, err = s.chatWithAccount(ctx, acc.ID, account, answerReq)
 		if IsEmptyCompletion(err) && tone != "magic" {
@@ -2798,8 +2911,15 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				err = nil
 			}
 		}
+// Failover only when nothing pins the request to a conversation or
+		// account; a fresh chat can safely retry on the next healthy account.
+		// The conversation-bound guard prevents dragging another account's
+		// conversation across accounts (image-limit errors still fail over).
 		if err != nil && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
 			originalErr := err
+			if IsImageLimitErr(originalErr) && s.accountPool != nil {
+				s.accountPool.MarkImageLimited(acc.ID)
+			}
 			// Failover only when nothing pins the request to a conversation or
 			// account; a fresh chat can safely retry on the next healthy account.
 			next, nerr := s.nextHealthyAccount(acc.ID)
@@ -2813,17 +2933,17 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				defer cancel2()
 				res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq)
 				if err2 == nil {
-					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
+					if IsImageLimitErr(originalErr) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
 					res = res2
 					acc = next
 					err = nil
 				} else {
-					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
+					if IsImageLimitErr(originalErr) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
-					if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
+					if IsImageLimitErr(err2) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(next.ID)
 					}
 					err = err2
@@ -2832,7 +2952,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 	}
 	if err != nil {
-		if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
+		if IsImageLimitErr(err) && s.accountPool != nil {
 			s.accountPool.MarkImageLimited(acc.ID)
 		}
 		if convReused {
@@ -2982,7 +3102,54 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	}
 	res.Text = sanitizePublicAssistantTextForModel(res.Text, body.Model)
 	res.Reasoning = sanitizePublicReasoningText(res.Reasoning)
-	log.Printf("[debug] res.Text bytes=%d content=%q", len(res.Text), res.Text)
+	if len(res.Images) == 0 {
+		if urls := extractImageURLs(res.RawResult); len(urls) > 0 {
+			res.Images = urls
+		}
+	}
+	if len(res.Images) == 0 {
+		if urls := extractImageURLs(res.Text); len(urls) > 0 {
+			res.Images = urls
+		}
+	}
+	if isImageModel(body.Model) && len(res.Images) == 0 && body.AccountID == "" {
+		currentAcc := acc
+		for attempt := 0; attempt < maxAccountProbe; attempt++ {
+			if s.accountPool != nil {
+				s.accountPool.MarkImageLimited(currentAcc.ID)
+			}
+			next, nerr := s.nextHealthyImageAccount(currentAcc.ID)
+			if nerr != nil || next.ID == "" {
+				break
+			}
+			log.Printf("[image-model-failover] id=%s attempt=%d from_acc=%s to_acc=%s", requestID, attempt+1, currentAcc.ID, next.ID)
+			currentAcc = next
+			res2, err2 := s.chatWithAccount(ctx, currentAcc.ID, chathub.Account{AccessToken: currentAcc.AccessToken, OID: currentAcc.OID, TID: currentAcc.TID}, answerReq)
+			if err2 == nil {
+				res = res2
+				acc = currentAcc
+				if len(res.Images) == 0 {
+					if urls := extractImageURLs(res.RawResult); len(urls) > 0 {
+						res.Images = urls
+					}
+				}
+				if len(res.Images) == 0 {
+					if urls := extractImageURLs(res.Text); len(urls) > 0 {
+						res.Images = urls
+					}
+				}
+				if len(res.Images) > 0 {
+					break
+				}
+			}
+		}
+	}
+	for _, imgURL := range res.Images {
+		if !strings.Contains(res.Text, imgURL) {
+			res.Text = strings.TrimSpace(res.Text) + "\n\n![image](" + imgURL + ")"
+		}
+	}
+	log.Printf("[debug] res.Text bytes=%d content=%q images=%d", len(res.Text), res.Text, len(res.Images))
 	created := time.Now().Unix()
 
 	if body.Stream {
