@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -195,9 +194,12 @@ type ResolveResult struct {
 }
 
 func clientIPFingerprint(r *http.Request) string {
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	// clientIP trusts X-Forwarded-For only when the direct peer is loopback,
+	// preserving spoofing resistance for direct external connections while
+	// keeping the fingerprint stable across local reverse-proxy connections.
+	ip := clientIP(r)
 	ua := r.Header.Get("User-Agent")
-	data := host + "|" + ua
+	data := ip + "|" + ua
 	h := sha256.Sum256([]byte(data))
 	return hex.EncodeToString(h[:16])
 }
@@ -314,6 +316,9 @@ func (sr *sessionResolver) matchSuffixLocked(tenant, ipFinger string, messages [
 			continue
 		}
 		n := suffixMatchLen(hist, messages)
+		if overlap := rollingOverlapLen(hist, messages); overlap > n {
+			n = overlap
+		}
 		// A pure tool round tail — [assistant(tool_calls), tool(result)] —
 		// is generic: concurrent tasks on the same box often produce
 		// identical tool invocations and outputs (e.g. git status on the
@@ -362,6 +367,30 @@ func suffixMatchLen(hist, msgs []oaiMsg) int {
 		}
 	}
 	return n
+}
+
+// rollingOverlapLen returns the longest suffix of stored history that matches
+// a prefix of the incoming rolling-window request. Messages after that prefix
+// are the new turn and should be sent incrementally on the existing cloud
+// conversation.
+func rollingOverlapLen(hist, msgs []oaiMsg) int {
+	maxN := len(hist)
+	if maxN > len(msgs) {
+		maxN = len(msgs)
+	}
+	for n := maxN; n >= 1; n-- {
+		matched := true
+		for i := 0; i < n; i++ {
+			if !messagesEqual(hist[len(hist)-n+i], msgs[i]) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return n
+		}
+	}
+	return 0
 }
 
 // matchContextLocked 浠庡叏閮ㄤ細璇濅腑鎵惧埌鍏?contextHistory 涓ユ牸浣滀负娑堟伅鍓嶇紑鐨?

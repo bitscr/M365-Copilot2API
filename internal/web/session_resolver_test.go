@@ -102,6 +102,79 @@ func resolverTestRequest(ip, ua, user string) *http.Request {
 	return r
 }
 
+// TestResolveBehindProxyStableForwardedIP reproduces a reverse proxy opening
+// each request from a different loopback source address. The stable forwarded
+// client IP must keep the conversation bound to the original cloud UUID.
+func TestResolveBehindProxyStableForwardedIP(t *testing.T) {
+	t.Setenv("M365_SESSION_CACHE", filepath.Join(t.TempDir(), "sessions.json"))
+	sr := openSessionResolver()
+
+	first := resolverTestRequest("127.0.0.1", "client-a", "alice")
+	first.RemoteAddr = "127.0.0.1:41001"
+	first.Header.Set("X-Forwarded-For", "203.0.113.10")
+	sr.Bind("sess-proxy", "conv-proxy", "acc-pinned",
+		&oaiReq{Messages: []oaiMsg{
+			{Role: "user", Content: "你有v4和v6嘛？"},
+			{Role: "assistant", Content: "有"},
+		}}, "", first)
+
+	next := resolverTestRequest("127.0.0.2", "client-a", "alice")
+	next.RemoteAddr = "127.0.0.2:52002"
+	next.Header.Set("X-Forwarded-For", "203.0.113.10")
+	res := sr.Resolve(next, &oaiReq{Messages: []oaiMsg{
+		{Role: "user", Content: "你有v4和v6嘛？"},
+		{Role: "assistant", Content: "有"},
+		{Role: "user", Content: "继续"},
+	}})
+	if res.IsNew {
+		t.Fatal("stable forwarded client IP created a new session when proxy source port changed")
+	}
+	if res.ConversationID != "conv-proxy" {
+		t.Fatalf("conversation=%q want conv-proxy", res.ConversationID)
+	}
+	if res.AccountID != "acc-pinned" {
+		t.Fatalf("account=%q want acc-pinned", res.AccountID)
+	}
+}
+
+// TestResolveRollingWindowContinuation reproduces clients that retain only a
+// rolling tail of the conversation. The incoming request contains an overlap
+// with the stored history followed by a new user turn; it must continue the
+// existing cloud conversation rather than round-robin to another account and
+// create a fresh UUID.
+func TestResolveRollingWindowContinuation(t *testing.T) {
+	t.Setenv("M365_SESSION_CACHE", filepath.Join(t.TempDir(), "sessions.json"))
+	sr := openSessionResolver()
+	req := resolverTestRequest("203.0.113.10", "client-a", "alice")
+
+	sr.Bind("sess-rolling", "conv-rolling", "acc-pinned",
+		&oaiReq{Messages: []oaiMsg{
+			{Role: "system", Content: "system prompt"},
+			{Role: "user", Content: "first question"},
+			{Role: "assistant", Content: "first answer"},
+			{Role: "user", Content: "second question"},
+			{Role: "assistant", Content: "second answer"},
+		}}, "", req)
+
+	res := sr.Resolve(req, &oaiReq{Messages: []oaiMsg{
+		{Role: "user", Content: "second question"},
+		{Role: "assistant", Content: "second answer"},
+		{Role: "user", Content: "third question"},
+	}})
+	if res.IsNew {
+		t.Fatal("rolling-window continuation created a new session")
+	}
+	if res.ConversationID != "conv-rolling" {
+		t.Fatalf("conversation=%q want conv-rolling", res.ConversationID)
+	}
+	if res.AccountID != "acc-pinned" {
+		t.Fatalf("account=%q want acc-pinned", res.AccountID)
+	}
+	if res.HistoryLen != 2 {
+		t.Fatalf("history overlap=%d want 2", res.HistoryLen)
+	}
+}
+
 // TestSuffixMatchRejectsToolTailedCrossTask is the regression test for the
 // multi-task memory cross-talk: two concurrent tasks on the same box produce
 // identical tool round tails (same tool call + same output, e.g. git status

@@ -2051,7 +2051,26 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		routePrompt := modelToolRouterPrompt(answerPrompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
 		log.Printf("[req-trace] id=%s stage=router_start prompt_len=%d", requestID, len(routePrompt))
 		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+		// The router prompt is a short decision task; some tones return an
+		// empty completion for it (observed: Gpt_5_6_Reasoning). Mirror the
+		// answer-path tone fallback before failing the whole request.
+		if IsEmptyCompletion(routeErr) && tone != "magic" {
+			log.Printf("[tone-fallback] router tone=%q returned empty, retrying with magic", tone)
+			routeRes, routeErr = s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: "magic", Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+		}
 		log.Printf("[req-trace] id=%s stage=router_return elapsed_ms=%d err=%t", requestID, time.Since(startedAt).Milliseconds(), routeErr != nil)
+		if routeErr != nil {
+			// The upstream could not produce a tool decision (empty
+			// completion on both the primary and magic tones). Degrade to a
+			// no-tool decision instead of failing the whole request: the
+			// answer path below still runs, and the model may answer the
+			// question directly (observed healthy on the same accounts).
+			if IsEmptyCompletion(routeErr) {
+				log.Printf("[router-degrade] id=%s upstream empty on tool decision, treating as no-tool and continuing to answer path", requestID)
+				routeErr = nil
+				routeRes = chathub.Result{Text: `{"calls":[]}`}
+			}
+		}
 		if routeErr != nil {
 			if IsRateLimited(routeErr) && body.AccountID == "" {
 				if next, nerr := s.nextHealthyAccount(acc.ID); nerr == nil {
@@ -2482,6 +2501,21 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	if planningMode == "router" && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
 		routePrompt := modelToolRouterPrompt(answerPrompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
 		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+		// Empty completions for the short router prompt are tone-specific;
+		// retry with the magic tone before giving up (mirrors the answer path).
+		if IsEmptyCompletion(routeErr) && tone != "magic" {
+			log.Printf("[tone-fallback] router tone=%q returned empty, retrying with magic", tone)
+			routeRes, routeErr = s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: "magic", Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+		}
+		// The upstream could not produce a tool decision even after the tone
+		// fallback. Degrade to a no-tool decision so the request reaches the
+		// answer path instead of failing with 502 (the answer path is healthy
+		// on the same accounts).
+		if IsEmptyCompletion(routeErr) {
+			log.Printf("[router-degrade] id=%s upstream empty on tool decision, treating as no-tool and continuing to answer path", requestID)
+			routeErr = nil
+			routeRes = chathub.Result{Text: `{"calls":[]}`}
+		}
 		if routeErr != nil {
 			if IsRateLimited(routeErr) || IsAuthFailure(routeErr) {
 				next, nerr := s.nextHealthyAccount(acc.ID)
@@ -2911,7 +2945,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				err = nil
 			}
 		}
-// Failover only when nothing pins the request to a conversation or
+		// Failover only when nothing pins the request to a conversation or
 		// account; a fresh chat can safely retry on the next healthy account.
 		// The conversation-bound guard prevents dragging another account's
 		// conversation across accounts (image-limit errors still fail over).

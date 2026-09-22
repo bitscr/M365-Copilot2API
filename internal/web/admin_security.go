@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -289,9 +290,57 @@ func auditLog(r *http.Request, event, detail string) {
 	}
 }
 
+// trustedProxyCIDRs are upstream proxy prefixes whose X-Forwarded-For header
+// is trusted as the real client address. The deployment sits behind
+// Cloudflare (365.xcx.pp.ua), so its published ranges are included; the
+// direct peer is verified against these prefixes before any header value is
+// accepted, so external spoofers that cannot originate from these prefixes
+// are ignored (same guarantee as the loopback-only rule).
+var trustedProxyCIDRs = []string{
+	// Cloudflare IPv4
+	"173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+	"141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+	"197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+	"104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+	// Cloudflare IPv6
+	"2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32",
+	"2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
+}
+
+var (
+	trustedProxyOnce   sync.Once
+	trustedProxyNets   []*net.IPNet
+	trustedProxyFailed bool
+)
+
+func isTrustedProxy(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	trustedProxyOnce.Do(func() {
+		for _, cidr := range trustedProxyCIDRs {
+			_, n, err := net.ParseCIDR(cidr)
+			if err != nil {
+				trustedProxyFailed = true
+				continue
+			}
+			trustedProxyNets = append(trustedProxyNets, n)
+		}
+	})
+	for _, n := range trustedProxyNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 func clientIP(r *http.Request) string {
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if net.ParseIP(host).IsLoopback() {
+	if isTrustedProxy(net.ParseIP(host)) {
 		parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
 		for i := len(parts) - 1; i >= 0; i-- {
 			if ip := net.ParseIP(strings.TrimSpace(parts[i])); ip != nil {
