@@ -1307,6 +1307,15 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 			body.SessionID = firstNonEmpty(body.SessionID, v.SessionID)
 		}
 	}
+	// A client-supplied conversation id pins the owning account; never let the
+	// pool round-robin a conversation onto a different account, which would
+	// bind one channel while the answer lands on another (empty reply).
+	if body.ConversationID != "" && body.AccountID == "" {
+		if sess, ok := s.sessionResolver.GetConversation(body.ConversationID); ok && sess.AccountID != "" {
+			body.AccountID = sess.AccountID
+			log.Printf("[session-resolver] conversation-bound account=%s conversation=%s", sess.AccountID, body.ConversationID)
+		}
+	}
 	acc, err := s.resolveAccount(body.AccountID)
 	if err != nil {
 		writeUpstreamError(w, err)
@@ -1348,8 +1357,10 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		// Failover: a rate-limited or auth-failed account must not take down the
 		// request when the pool has other healthy accounts. Only auto-selected
 		// requests fail over; an explicitly chosen account is respected, and a
-		// conversation-bound chat stays on its account.
-		if body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (IsRateLimited(err) || body.ConversationID == "") {
+		// conversation-bound chat stays on its account — a different account
+		// cannot continue another account's cloud conversation (the gateway
+		// would poll an empty channel and the answer would be lost).
+		if body.AccountID == "" && body.ConversationID == "" && (IsRateLimited(err) || IsAuthFailure(err)) {
 			next, nerr := s.nextHealthyAccount(acc.ID)
 			if nerr == nil {
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
@@ -1851,7 +1862,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			resolvedConversationID = resolved.ConversationID
 			body.ConversationID = resolved.ConversationID
 			body.SessionID = resolved.SessionID
-			body.AccountID = firstNonEmpty(body.AccountID, resolved.AccountID)
+			// The resolved conversation belongs to exactly one account; a
+			// client-supplied accountId must not override it, or the request
+			// would be sent to D while the conversation lives on C.
+			if resolved.AccountID != "" {
+				body.AccountID = resolved.AccountID
+			} else {
+				body.AccountID = firstNonEmpty(body.AccountID, resolved.AccountID)
+			}
 			log.Printf("[session-resolver] matched=%s conversation=%s history=%d total=%d", resolved.MatchedBy, resolved.ConversationID, resolved.HistoryLen, len(body.Messages))
 			if resolved.HistoryLen > 0 && resolved.HistoryLen < len(body.Messages) {
 				incPrompt, incAtt := flattenPromptMessages(body.Messages[resolved.HistoryLen:], nil)
@@ -1861,6 +1879,17 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					body.Attachments = incAtt
 				}
 			}
+		}
+	}
+	// A client-supplied conversation id pins the owning account: the cloud
+	// conversation belongs to exactly one M365 account, and another account
+	// cannot continue it (the gateway would bind one channel while the reply
+	// lands elsewhere — the empty-conversation symptom). Resolve the binding
+	// back to its account before the pool gets a chance to round-robin.
+	if body.ConversationID != "" && body.AccountID == "" {
+		if sess, ok := s.sessionResolver.GetConversation(body.ConversationID); ok && sess.AccountID != "" {
+			body.AccountID = sess.AccountID
+			log.Printf("[session-resolver] conversation-bound account=%s conversation=%s", sess.AccountID, body.ConversationID)
 		}
 	}
 	accountID := body.AccountID
@@ -1965,12 +1994,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[req-trace] id=%s stage=router_start prompt_len=%d", requestID, len(routePrompt))
 		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
 		log.Printf("[req-trace] id=%s stage=router_return elapsed_ms=%d err=%t", requestID, time.Since(startedAt).Milliseconds(), routeErr != nil)
-		// Router turns run in a throwaway cloud conversation that is never
-		// reused by the answer turn; delete it so the conversation list does
-		// not accumulate one entry per routed request.
-		if routeErr == nil && routeRes.ConversationID != "" {
-			s.dropTransientConversation(routeRes.ConversationID)
-		}
 		if routeErr != nil {
 			if IsRateLimited(routeErr) && body.AccountID == "" {
 				if next, nerr := s.nextHealthyAccount(acc.ID); nerr == nil {
@@ -1980,6 +2003,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 						routeRes = routeRes2
 						acc = next
 						account = chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
+						// The failover account cannot continue a conversation
+						// owned by the original account; start a fresh chain.
+						body.ConversationID = ""
+						body.SessionID = ""
 						routeErr = nil
 					} else {
 						s.accountPool.MarkFailure(next.ID, routeErr2, s.getRateLimitCooldown())
@@ -2000,15 +2027,18 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 		calls = filterCompletedCalls(calls, ledger)
 		calls, _ = validateCalls("router", calls)
+		toolRes := routeRes
 		if !parsed {
 			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
-			if repairErr == nil && repairRes.ConversationID != "" {
-				s.dropTransientConversation(repairRes.ConversationID)
-			}
 			if repairErr == nil {
 				calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
 				calls = filterCompletedCalls(calls, ledger)
 				calls, _ = validateCalls("router", calls)
+				// The repaired decision is the authoritative one; bind and
+				// respond from this conversation, not the mis-parsed one.
+				toolRes = repairRes
+			} else if repairRes.ConversationID != "" {
+				s.dropTransientConversation(repairRes.ConversationID)
 			}
 		}
 		if parsed && len(calls) > 0 {
@@ -2020,8 +2050,27 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
 				calls = calls[:1]
 			}
-			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, body.shouldSendStreamUsage(), calls, routeRes)
+			// Tool rounds must be bound exactly like answer rounds: the client's
+			// next turn carries the accumulated tool results and must resolve
+			// back to this same cloud conversation and account. Without the
+			// binding every tool round creates a fresh orphan conversation and
+			// the account drifts round by round.
+			if toolRes.ConversationID != "" {
+				s.bindConversation(acc, &body, r, toolRes, answerPrompt, startedAt)
+				s.storeConvCache(tenant, acc.ID, convCacheModel, toolRes, tone, body.Messages, convReused)
+				w.Header().Set(sessionHeaderName, toolRes.SessionID)
+			}
+			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, body.shouldSendStreamUsage(), calls, toolRes)
 			return
+		}
+		// No tool was selected: the router decision conversations are
+		// throwaway — drop them so the cloud list does not accumulate one
+		// entry per routed request.
+		if toolRes.ConversationID != "" && toolRes.ConversationID != routeRes.ConversationID {
+			s.dropTransientConversation(toolRes.ConversationID)
+		}
+		if routeRes.ConversationID != "" {
+			s.dropTransientConversation(routeRes.ConversationID)
 		}
 	}
 	if body.Stream {
@@ -2378,6 +2427,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 						routeRes, routeErr = res2, nil
 						acc = next
 						account = chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
+						// Failover onto a different account must not drag along
+						// the original account's conversation: the answer would
+						// land on a channel the gateway is not polling.
+						body.ConversationID = ""
+						body.SessionID = ""
 					} else {
 					}
 				}
@@ -2392,13 +2446,25 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
+		toolRes := routeRes
 		if !parsed {
 			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Do not invent calls; use {"calls":[]} if unrecoverable. OUTPUT:
 ` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
 			if repairErr == nil {
 				calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
+				// The repaired decision is the authoritative one; bind and
+				// respond from this conversation, not the mis-parsed one.
+				toolRes = repairRes
+			} else if repairRes.ConversationID != "" {
+				s.dropTransientConversation(repairRes.ConversationID)
 			}
 			if !parsed {
+				// The repaired decision is still unparseable; the repair
+				// conversation is throwaway — don't leave it orphaned in the
+				// cloud list.
+				if toolRes.ConversationID != "" && toolRes.ConversationID != routeRes.ConversationID {
+					s.dropTransientConversation(toolRes.ConversationID)
+				}
 				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "model returned an invalid tool routing decision")
 				return
 			}
@@ -2414,8 +2480,25 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
 				calls = calls[:1]
 			}
-			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, body.shouldSendStreamUsage(), calls, routeRes)
+			// Bind the router round's conversation so the next tool round in
+			// this client session resolves back to the same cloud conversation
+			// and account instead of spawning a fresh orphan conversation.
+			if toolRes.ConversationID != "" {
+				s.bindConversation(acc, &body, r, toolRes, answerPrompt, startedAt)
+				s.storeConvCache(tenant, acc.ID, convCacheModel, toolRes, tone, body.Messages, convReused)
+				w.Header().Set(sessionHeaderName, toolRes.SessionID)
+			}
+			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, body.shouldSendStreamUsage(), calls, toolRes)
 			return
+		}
+		// No tool was selected: the router decision conversations are
+		// throwaway — drop them so the cloud list does not accumulate one
+		// entry per routed request.
+		if toolRes.ConversationID != "" && toolRes.ConversationID != routeRes.ConversationID {
+			s.dropTransientConversation(toolRes.ConversationID)
+		}
+		if routeRes.ConversationID != "" {
+			s.dropTransientConversation(routeRes.ConversationID)
 		}
 		if fmt.Sprint(body.ToolChoice) == "required" {
 			defs, _ := json.Marshal(toolMaps)
@@ -2436,8 +2519,21 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
 						calls = calls[:1]
 					}
+					// Bind the constrained-retry conversation exactly like the
+					// plain router round so follow-up tool rounds stay on the
+					// same cloud conversation and account.
+					if retryRes.ConversationID != "" {
+						s.bindConversation(acc, &body, r, retryRes, answerPrompt, startedAt)
+						s.storeConvCache(tenant, acc.ID, convCacheModel, retryRes, tone, body.Messages, convReused)
+						w.Header().Set(sessionHeaderName, retryRes.SessionID)
+					}
 					_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, body.shouldSendStreamUsage(), calls, retryRes)
 					return
+				}
+				// The constrained retry produced no call; its conversation is
+				// throwaway — don't leave it orphaned.
+				if retryRes.ConversationID != "" {
+					s.dropTransientConversation(retryRes.ConversationID)
 				}
 			}
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "model did not select a required tool after constrained retry")
@@ -2594,7 +2690,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}
 			err = nil
 		}
-		if err != nil && streamedReasoningLen == 0 && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
+		if err != nil && streamedReasoningLen == 0 && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
 			originalErr := err
 			next, nerr := s.nextHealthyAccount(acc.ID)
 			if nerr == nil {
@@ -2702,7 +2798,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				err = nil
 			}
 		}
-		if err != nil && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
+		if err != nil && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
 			originalErr := err
 			// Failover only when nothing pins the request to a conversation or
 			// account; a fresh chat can safely retry on the next healthy account.
