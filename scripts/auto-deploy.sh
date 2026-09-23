@@ -11,6 +11,11 @@ DATA=/root/m365-data
 LOG="$DATA/autodeploy.log"
 GO=/usr/local/go/bin/go
 SVC=m365-api.service
+# systemd timer 环境没有 GOPATH/GOMODCACHE,而 go 1.23+ 默认要求显式设置;
+# 直接指向宿主机真实的 module cache,避免 autodeploy 在 go test 阶段报
+# "module cache not found" 并把刚推送的提交 reset 掉。
+export GOMODCACHE=/root/go/pkg/mod
+export GOPATH=/root/go
 
 log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
 
