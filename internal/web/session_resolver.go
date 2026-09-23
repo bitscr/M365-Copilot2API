@@ -193,15 +193,44 @@ type ResolveResult struct {
 	HistoryLen int
 }
 
+// clientIPFingerprint derives the resolver's client identity. What it
+// includes is configurable via M365_FINGERPRINT_MODE so deployments are not
+// tied to a stable client IP (mobile egress, WARP, NAT, or rotating proxies
+// would otherwise break session continuity):
+//
+//	ip_ua (default) — client IP + User-Agent; most precise, requires stable egress IP.
+//	ua              — User-Agent only; survives IP rotation, still separates agents.
+//	off             — no client identity; tenant + message content only (permissive).
+//
+// The session resolver additionally scopes by tenant and requires content
+// fingerprints to match, so lowering the identity strength never re-enables
+// cross-tenant bleed.
 func clientIPFingerprint(r *http.Request) string {
-	// clientIP trusts X-Forwarded-For only when the direct peer is loopback,
-	// preserving spoofing resistance for direct external connections while
-	// keeping the fingerprint stable across local reverse-proxy connections.
-	ip := clientIP(r)
 	ua := r.Header.Get("User-Agent")
+	switch fingerprintMode() {
+	case "ua":
+		h := sha256.Sum256([]byte(ua))
+		return hex.EncodeToString(h[:16])
+	case "off", "none":
+		return ""
+	}
+	// default: ip_ua
+	ip := clientIP(r)
 	data := ip + "|" + ua
 	h := sha256.Sum256([]byte(data))
 	return hex.EncodeToString(h[:16])
+}
+
+var (
+	fingerprintModeOnce sync.Once
+	fingerprintModeVal  string
+)
+
+func fingerprintMode() string {
+	fingerprintModeOnce.Do(func() {
+		fingerprintModeVal = strings.ToLower(strings.TrimSpace(os.Getenv("M365_FINGERPRINT_MODE")))
+	})
+	return fingerprintModeVal
 }
 
 func contextFingerprint(messages []oaiMsg) string {
@@ -453,34 +482,78 @@ func contextPrefixLen(hist, msgs []oaiMsg) int {
 	return len(hist)
 }
 
-// messagesEqual 鍒ゅ畾涓ゆ潯娑堟伅鍦ㄤ細璇濋敭鎰忎箟涓婄瓑浠凤細role 涓庢枃鏈唴瀹逛竴鑷淬€?
-// 蹇界暐 tool_calls 鐨?ID 缁嗚妭锛堜細璇濋敭鍙叧蹇冨唴瀹瑰浣曡妯″瀷娑堝寲锛夈€?
+// messagesEqual 判断两条消息在会话键意义上等价：role 与文本内容一致。
+// 忽略 tool_calls 的 ID 细节（会话键只关心内容如何被模型消化）。
+// 工具调用存在两种等价形态：结构化 tool_calls（OpenAI 重放）与
+// "CALL_TOOL: name({...})" 纯文本（上游模型文本决策/客户端改写重放）。
+// 同一逻辑工具调用以不同形态出现在前后轮时视为相等，否则连续工具循环
+// 的会话前缀永远无法匹配（每轮都新建 cloud conversation）。
 func messagesEqual(a, b oaiMsg) bool {
 	if a.Role != b.Role {
 		return false
 	}
-	ta := contentToString(a.Content)
-	tb := contentToString(b.Content)
-	if ta != tb {
-		return false
-	}
-	if (a.ToolCalls == nil) != (b.ToolCalls == nil) {
-		return false
-	}
-	for i := range a.ToolCalls {
-		if i >= len(b.ToolCalls) {
-			return false
+	ha, hb := toolCallsFromMessage(a), toolCallsFromMessage(b)
+	if len(ha) > 0 || len(hb) > 0 {
+		if len(ha) != len(hb) {
+			// 一边有工具调用另一边完全没有（纯文本对话 vs 工具链）必然不等，
+			// 除非是 CALL_TOOL 文本形态 —— 该形态已由 toolCallsFromMessage 提取。
+			return len(ha) == 0 && len(hb) == 0
 		}
-		if toolCallEqual(a.ToolCalls[i], b.ToolCalls[i]) {
-			continue
+		for i := range ha {
+			if !toolCallEqual(ha[i], hb[i]) {
+				return false
+			}
 		}
-		return false
+		return true
 	}
-	return len(a.ToolCalls) == len(b.ToolCalls)
+	// 两边都无工具调用：严格按内容比较。
+	return contentToString(a.Content) == contentToString(b.Content)
+}
+
+// toolCallsFromMessage 提取语义上的工具调用列表：结构化 tool_calls 原样返回；
+// "CALL_TOOL: name({...})" 纯文本形态解析为等价工具调用。返回 nil 表示该消息
+// 不携带任何工具调用（纯文本/普通轮次）。
+func toolCallsFromMessage(m oaiMsg) []map[string]any {
+	if len(m.ToolCalls) > 0 {
+		return m.ToolCalls
+	}
+	if len(m.ToolCalls) == 0 && m.Role == "assistant" {
+		if calls := parseCallToolText(contentToString(m.Content)); len(calls) > 0 {
+			return calls
+		}
+	}
+	return nil
+}
+
+// parseCallToolText 解析 "CALL_TOOL: name({...})" 文本，返回按 name+arguments
+// 组织的工具调用列表（arguments 为原始 JSON 字符串）。
+func parseCallToolText(text string) []map[string]any {
+	t := strings.TrimSpace(text)
+	if !strings.HasPrefix(t, "CALL_TOOL:") && !strings.HasPrefix(t, "call_tool:") {
+		return nil
+	}
+	rest := strings.TrimSpace(t[strings.Index(t, ":")+1:])
+	start := strings.Index(rest, "(")
+	end := strings.LastIndex(rest, ")")
+	if start <= 0 || end <= start {
+		return nil
+	}
+	name := strings.TrimSpace(rest[:start])
+	args := strings.TrimSpace(rest[start+1 : end])
+	if name == "" {
+		return nil
+	}
+	return []map[string]any{{
+		"function": map[string]any{
+			"name":      name,
+			"arguments": args,
+		},
+	}}
 }
 
 // toolCallEqual 比较 name 与 arguments，忽略 ID：同一段工具调用重放时
-// ID 由客户端重新生成，不应影响会话键。
+// ID 由客户端重新生成，不应影响会话键。arguments 做 JSON 语义比较，
+// 容忍键序差异（如 {"a":1,"b":2} 与 {"b":2,"a":1} 是同一调用）。
 func toolCallEqual(x, y map[string]any) bool {
 	xFunc, _ := x["function"].(map[string]any)
 	yFunc, _ := y["function"].(map[string]any)
@@ -491,7 +564,21 @@ func toolCallEqual(x, y map[string]any) bool {
 	}
 	xa, _ := xFunc["arguments"].(string)
 	ya, _ := yFunc["arguments"].(string)
-	return xa == ya
+	return normalizeJSONArgs(xa) == normalizeJSONArgs(ya)
+}
+
+// normalizeJSONArgs 将参数 JSON 归一化（解析后重排），对非 JSON/无法解析的
+// 原样返回，保证比较既容忍键序又不会把畸形参数误判为相等。
+func normalizeJSONArgs(s string) string {
+	var v any
+	if json.Unmarshal([]byte(s), &v) != nil {
+		return s
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return s
+	}
+	return string(b)
 }
 
 func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, body *oaiReq, assistantText string, r *http.Request) {

@@ -290,13 +290,42 @@ func auditLog(r *http.Request, event, detail string) {
 	}
 }
 
-// trustedProxyCIDRs are upstream proxy prefixes whose X-Forwarded-For header
-// is trusted as the real client address. The deployment sits behind
-// Cloudflare (365.xcx.pp.ua), so its published ranges are included; the
-// direct peer is verified against these prefixes before any header value is
-// accepted, so external spoofers that cannot originate from these prefixes
-// are ignored (same guarantee as the loopback-only rule).
-var trustedProxyCIDRs = []string{
+// Trusted proxy configuration for clientIP().
+//
+// clientIP() only trusts X-Forwarded-For when the direct peer belongs to a
+// trusted proxy (loopback is always trusted). Which prefixes count as
+// trusted is configured via M365_TRUSTED_PROXIES so deployments behind
+// nginx, caddy, haproxy, Cloudflare, or a plain NAT can set their own
+// topology instead of being hardcoded to one provider.
+//
+// Format: comma-separated CIDRs, e.g. "10.0.0.0/8,192.168.1.0/24".
+// The token "cloudflare" expands to Cloudflare's published ranges.
+// Empty/unset: only loopback is trusted (safe default).
+func trustedProxyCIDRs() []string {
+	raw := strings.TrimSpace(os.Getenv("M365_TRUSTED_PROXIES"))
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if part == "cloudflare" {
+			out = append(out, cloudflareProxyCIDRs...)
+			continue
+		}
+		if _, _, err := net.ParseCIDR(part); err == nil {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+// cloudflareProxyCIDRs are Cloudflare's published proxy ranges, expanded by
+// the "cloudflare" token in M365_TRUSTED_PROXIES.
+var cloudflareProxyCIDRs = []string{
 	// Cloudflare IPv4
 	"173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
 	"141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
@@ -321,7 +350,7 @@ func isTrustedProxy(ip net.IP) bool {
 		return true
 	}
 	trustedProxyOnce.Do(func() {
-		for _, cidr := range trustedProxyCIDRs {
+		for _, cidr := range trustedProxyCIDRs() {
 			_, n, err := net.ParseCIDR(cidr)
 			if err != nil {
 				trustedProxyFailed = true

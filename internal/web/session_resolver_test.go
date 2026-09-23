@@ -384,3 +384,103 @@ func TestAutoCleanupDefaultMaxAgeTwoHours(t *testing.T) {
 		t.Error("3h 闲置的会话不应在 2h 保护窗口内")
 	}
 }
+
+// TestResolveTextCallToolEqualsToolCalls is the regression test for the
+// conversation-stratification bug: the same logical tool call appears as
+// structured assistant tool_calls in one round and as a plain-text
+// "CALL_TOOL: name({...})" assistant message in the next. The resolver must
+// treat both forms as the same conversation key, or every tool-loop turn
+// resolves IsNew → new account → new cloud conversation.
+func TestResolveTextCallToolEqualsToolCalls(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("M365_SESSION_CACHE", filepath.Join(dir, "sessions.json"))
+	t.Setenv("M365_CONVERSATION_CACHE", filepath.Join(dir, "conversations.json"))
+	t.Setenv("M365_USER_SESSION_CACHE", filepath.Join(dir, "users.json"))
+	sr := openSessionResolver()
+	req := resolverTestRequest("203.0.113.10", "client-a", "alice")
+
+	// Round 1: text-form tool call bound as assistant content (upstream model
+	// answered in CALL_TOOL text form; bind stored it verbatim).
+	round1 := []oaiMsg{
+		{Role: "developer", Content: "<project_instructions>"},
+		{Role: "user", Content: "run check"},
+		{Role: "assistant", Content: "CALL_TOOL: skill_view({\"name\":\"m365-panel\"})"},
+		{Role: "tool", ToolCallID: "call_1", Content: "{\"success\": true, \"name\": \"m365-panel\"}"},
+	}
+	sr.Bind("", "conv-textform", "acc-x", &oaiReq{Messages: round1}, "CALL_TOOL: terminal({\"command\":\"id\"})", req)
+
+	// Round 2: the client replayed the same logical call in structured
+	// tool_calls form (OpenAI serialization), plus the tool result.
+	round2 := []oaiMsg{
+		round1[0], round1[1], round1[2], round1[3],
+		{Role: "assistant", Content: "", ToolCalls: []map[string]any{{
+			"id": "call_9", "type": "function",
+			"function": map[string]any{"name": "terminal", "arguments": `{"command":"id"}`},
+		}}},
+		{Role: "tool", ToolCallID: "call_9", Content: `{"output": "uid=0", "exit_code": 0}`},
+		{Role: "user", Content: "next"},
+	}
+	res := sr.Resolve(req, &oaiReq{Messages: round2})
+	if res.IsNew {
+		t.Fatal("text CALL_TOOL vs structured tool_calls 应视为同一会话键，实际 IsNew")
+	}
+	if res.ConversationID != "conv-textform" {
+		t.Fatalf("expected conv-textform, got %s (matched=%s)", res.ConversationID, res.MatchedBy)
+	}
+}
+
+// TestResolveToolCallsEqualsTextCallTool is the mirror case: stored history in
+// tool_calls form, next round replayed as CALL_TOOL text.
+func TestResolveToolCallsEqualsTextCallTool(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("M365_SESSION_CACHE", filepath.Join(dir, "sessions.json"))
+	t.Setenv("M365_CONVERSATION_CACHE", filepath.Join(dir, "conversations.json"))
+	t.Setenv("M365_USER_SESSION_CACHE", filepath.Join(dir, "users.json"))
+	sr := openSessionResolver()
+	req := resolverTestRequest("203.0.113.10", "client-a", "alice")
+
+	round1 := []oaiMsg{
+		{Role: "developer", Content: "<project_instructions>"},
+		{Role: "user", Content: "run check"},
+		{Role: "assistant", Content: "", ToolCalls: []map[string]any{{
+			"id": "call_1", "type": "function",
+			"function": map[string]any{"name": "terminal", "arguments": `{"command":"id"}`},
+		}}},
+		{Role: "tool", ToolCallID: "call_1", Content: "{\"output\": \"uid=0\"}"},
+	}
+	sr.Bind("", "conv-tcform", "acc-y", &oaiReq{Messages: round1}, "", req)
+
+	round2 := []oaiMsg{
+		round1[0], round1[1], round1[2], round1[3],
+		{Role: "assistant", Content: "CALL_TOOL: execute_code({\"code\":\"id\"})"},
+		{Role: "user", Content: "next"},
+	}
+	res := sr.Resolve(req, &oaiReq{Messages: round2})
+	if res.IsNew {
+		t.Fatal("structured tool_calls 历史 应被文本 CALL_TOOL 续接，实际 IsNew")
+	}
+	if res.ConversationID != "conv-tcform" {
+		t.Fatalf("expected conv-tcform, got %s (matched=%s)", res.ConversationID, res.MatchedBy)
+	}
+}
+
+// TestMessagesEqualToolCallArgumentKeyOrderToolerance: JSON argument key order
+// must not break equality for the same logical call.
+func TestMessagesEqualToolCallArgumentKeyOrder(t *testing.T) {
+	a := oaiMsg{Role: "assistant", Content: "CALL_TOOL: exec({\"a\":1,\"b\":2})"}
+	b := oaiMsg{Role: "assistant", Content: "", ToolCalls: []map[string]any{{
+		"id": "x", "type": "function",
+		"function": map[string]any{"name": "exec", "arguments": `{"b":2,"a":1}`},
+	}}}
+	if !messagesEqual(a, b) {
+		t.Fatal("键序不同的同一工具调用应判等")
+	}
+	c := oaiMsg{Role: "assistant", Content: "CALL_TOOL: exec({\"a\":1,\"b\":9})"}
+	if messagesEqual(a, c) {
+		t.Fatal("参数不同的调用不应判等")
+	}
+	d := oaiMsg{Role: "assistant", Content: "plain text answer"}
+	if messagesEqual(a, d) {
+		t.Fatal("普通文本不应与工具调用判等")
+	}
+}
