@@ -158,4 +158,7 @@ func (s *Server) activeConversationSet(window time.Duration) map[string]bool {
 func (s *Server) dropConversation(convID string) {
 	s.conversationManager.Delete(convID)
 	s.sessionResolver.UnbindByConversation(convID)
+	if s.convCache != nil {
+		s.convCache.InvalidateByConversation(convID)
+	}
 }

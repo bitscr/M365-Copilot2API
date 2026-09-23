@@ -20,6 +20,7 @@ func newTestServerForAutoCleanup(t *testing.T) *Server {
 		userSessions:        openUserSessionStore(30 * time.Minute),
 		sessionResolver:     openSessionResolver(),
 		conversationManager: openConversationManager(),
+		convCache:           newConversationCache(),
 	}
 }
 
@@ -172,5 +173,120 @@ func TestLegacyConversationFileLoads(t *testing.T) {
 	cm := openConversationManager()
 	if _, ok := cm.data["conv-old"]; !ok {
 		t.Error("legacy conversation file must still load")
+	}
+}
+
+// TestDropConversationCleansAllStores is the regression test for the
+// intermittent "sometimes continues, sometimes doesn't, new chat always
+// works" symptom: when a cloud conversation is deleted (manual delete,
+// auto-cleanup, or keep-N eviction) the session resolver binding and the
+// conversation cache fast-path entry must be dropped with it. Otherwise the
+// next request with full history resolves to a dead ConversationID and
+// 502s, while a brand-new conversation (no history prefix) works fine.
+func TestDropConversationCleansAllStores(t *testing.T) {
+	s := newTestServerForAutoCleanup(t)
+
+	reqFor := func(key string) *http.Request {
+		r := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+		r.Header.Set("Authorization", "Bearer "+key)
+		return r
+	}
+
+	// Simulate a live conversation: bound in the resolver and cached in the
+	// conv-cache fast path, exactly as a completed request leaves it.
+	msgs := []oaiMsg{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "hi"},
+		{Role: "assistant", Content: "hello"},
+	}
+	s.sessionResolver.Bind("sess-dead", "conv-dead", "acc1", &oaiReq{Messages: msgs}, "", reqFor("key-a"))
+	s.convCache.Store("acc1", "gpt-5.6-reasoning", tenantFromRequest(reqFor("key-a")), &cachedConversation{
+		ConversationID: "conv-dead",
+		SessionID:      "sess-dead",
+	})
+	// A second live conversation must survive.
+	s.sessionResolver.Bind("sess-live", "conv-live", "acc1", &oaiReq{Messages: []oaiMsg{{Role: "user", Content: "other"}}}, "", reqFor("key-a"))
+	s.convCache.Store("acc1", "gpt-5.6-reasoning", tenantFromRequest(reqFor("key-a")), &cachedConversation{
+		ConversationID: "conv-live",
+		SessionID:      "sess-live",
+	})
+
+	s.dropConversation("conv-dead")
+
+	// Resolver binding gone.
+	if _, ok := s.sessionResolver.GetSession(tenantFromRequest(reqFor("key-a")), "sess-dead"); ok {
+		t.Error("resolver binding for dead conversation must be removed")
+	}
+	if _, ok := s.sessionResolver.GetSession(tenantFromRequest(reqFor("key-a")), "sess-live"); !ok {
+		t.Error("resolver binding for live conversation must survive")
+	}
+	// Conv-cache fast-path entries: dead one gone, live one survives.
+	if got := s.convCache.Lookup("acc1", "gpt-5.6-reasoning", tenantFromRequest(reqFor("key-a"))); got != nil && got.ConversationID == "conv-dead" {
+		t.Error("conv-cache entry for dead conversation must be invalidated")
+	}
+	if got := s.convCache.Lookup("acc1", "gpt-5.6-reasoning", tenantFromRequest(reqFor("key-a"))); got == nil || got.ConversationID != "conv-live" {
+		t.Error("conv-cache entry for live conversation must survive")
+	}
+	if _, ok := s.conversationManager.data["conv-dead"]; ok {
+		t.Error("conversation manager record for dead conversation must be dropped")
+	}
+}
+
+// TestBindConversationCleanupUnbindsDeadSessions covers the auto-clean path
+// in bindConversation: conversationManager.Cleanup() returns ids the manager
+// evicted, and each one must be dropped from resolver + conv-cache too.
+func TestBindConversationCleanupUnbindsDeadSessions(t *testing.T) {
+	s := newTestServerForAutoCleanup(t)
+	// Keep-N mode with a capacity of 2: recording a third conversation evicts
+	// the least-recently-used one.
+	s.conversationManager.SetMode(CleanupKeepN)
+	s.conversationManager.keepN = 2
+
+	reqFor := func(key string) *http.Request {
+		r := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+		r.Header.Set("Authorization", "Bearer "+key)
+		return r
+	}
+	tenant := tenantFromRequest(reqFor("key-a"))
+
+	// Two LRU evictions.
+	for i, cv := range []string{"conv-old", "conv-live"} {
+		s.sessionResolver.Bind("sess-"+cv, cv, "acc1", &oaiReq{Messages: []oaiMsg{{Role: "user", Content: cv}}}, "", reqFor("key-a"))
+		s.convCache.Store("acc1", "gpt-5.6-reasoning", tenant, &cachedConversation{ConversationID: cv, SessionID: "sess-" + cv})
+		s.conversationManager.Record(cv, "acc1", cv)
+		// Backdate the first one so it becomes LRU when the third lands.
+		if i == 0 {
+			s.conversationManager.mu.Lock()
+			old := s.conversationManager.data[cv]
+			old.LastUsedAt = time.Now().UTC().Add(-time.Hour)
+			s.conversationManager.data[cv] = old
+			s.conversationManager.mu.Unlock()
+		}
+	}
+
+	// The third binding + auto-clean trigger.
+	s.sessionResolver.Bind("sess-new", "conv-new", "acc1", &oaiReq{Messages: []oaiMsg{{Role: "user", Content: "conv-new"}}}, "", reqFor("key-a"))
+	s.conversationManager.Record("conv-new", "acc1", "conv-new")
+	if s.conversationManager.ShouldCleanup() {
+		if cleaned := s.conversationManager.Cleanup(); len(cleaned) > 0 {
+			for _, cvID := range cleaned {
+				s.dropConversation(cvID)
+			}
+		}
+	}
+
+	// conv-old was evicted: resolver binding and conv-cache entry gone.
+	if _, ok := s.sessionResolver.GetSession(tenant, "sess-conv-old"); ok {
+		t.Error("evicted conversation binding must be unbound from resolver")
+	}
+	if got := s.convCache.Lookup("acc1", "gpt-5.6-reasoning", tenant); got != nil && got.ConversationID == "conv-old" {
+		t.Error("conv-cache must not reuse an evicted conversation")
+	}
+	// The live and new conversations survive.
+	if _, ok := s.sessionResolver.GetSession(tenant, "sess-conv-live"); !ok {
+		t.Error("live conversation binding must survive cleanup")
+	}
+	if _, ok := s.sessionResolver.GetSession(tenant, "sess-new"); !ok {
+		t.Error("new conversation binding must survive cleanup")
 	}
 }

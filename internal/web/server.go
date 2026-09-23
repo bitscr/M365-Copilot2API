@@ -3379,6 +3379,16 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 	if s.conversationManager.ShouldCleanup() {
 		if cleaned := s.conversationManager.Cleanup(); len(cleaned) > 0 {
 			log.Printf("[conversation-manager] auto-cleaned %d conversations", len(cleaned))
+			// The manager only drops its own records; the session resolver and
+			// conversation cache still hold bindings to these (now-deleted)
+			// cloud conversations. Leaving them in place makes the next request
+			// with a full history resolve to a dead ConversationID — the
+			// intermittent "sometimes continues / sometimes doesn't" symptom a
+			// new chat never hits. Unbind them here so nothing resumes a dead
+			// conversation.
+			for _, cvID := range cleaned {
+				s.dropConversation(cvID)
+			}
 		}
 	}
 

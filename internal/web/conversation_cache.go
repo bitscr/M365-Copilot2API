@@ -80,6 +80,19 @@ func (c *conversationCache) Invalidate(accountID, model, tenant string) {
 	delete(c.entries, c.key(accountID, model, tenant))
 }
 
+// InvalidateByConversation drops every cache entry bound to the given cloud
+// conversation ID. Used when a cloud conversation is deleted so subsequent
+// requests never reuse a dead ConversationID through the fast-path cache.
+func (c *conversationCache) InvalidateByConversation(conversationID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, v := range c.entries {
+		if v.ConversationID == conversationID {
+			delete(c.entries, k)
+		}
+	}
+}
+
 func (c *conversationCache) GC() {
 	c.mu.Lock()
 	defer c.mu.Unlock()

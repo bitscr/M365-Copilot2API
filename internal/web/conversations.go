@@ -48,6 +48,9 @@ func (s *Server) conversationCleanup(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	cleaned := s.conversationManager.Cleanup()
+	for _, cvID := range cleaned {
+		s.dropConversation(cvID)
+	}
 	jsonOut(w, map[string]any{
 		"status":    "cleaned",
 		"mode":      string(s.conversationManager.Mode()),
