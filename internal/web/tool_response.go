@@ -8,6 +8,44 @@ import (
 )
 
 func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, sendUsage bool, calls []detectedToolCall, res chathub.Result) error {
+	// Local-exec / no-tool final answer: no tool calls were emitted, so this
+	// is a plain assistant text result (the gateway already ran the tools and
+	// received the follow-up answer). Serialize it as a normal completion —
+	// serializing it as a tool_calls response would drop res.Text entirely
+	// (content: nil, finish_reason: "tool_calls").
+	if len(calls) == 0 && res.Text != "" {
+		msg := map[string]any{"role": "assistant", "content": sanitizePublicAssistantText(res.Text)}
+		if reasoning := sanitizePublicReasoningText(res.Reasoning); reasoning != "" {
+			msg["reasoning_content"] = reasoning
+		}
+		pt := EstimateTokens(res.Text)
+		ct := EstimateTokens(res.Text)
+		usage := map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+		if stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			flusher, _ := w.(http.Flusher)
+			created := time.Now().Unix()
+			first := map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": ""}, "finish_reason": nil}}}
+			if reasoning := sanitizePublicReasoningText(res.Reasoning); reasoning != "" {
+				first["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["reasoning_content"] = reasoning
+			}
+			_ = sseSafeRaw(w, flusher, "data: "+mustJSON(first)+"\n\n")
+			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": sanitizePublicAssistantText(res.Text)}, "finish_reason": nil}}}
+			_ = sseSafeRaw(w, flusher, "data: "+mustJSON(chunk)+"\n\n")
+			if sendUsage {
+				usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": nil}}, "usage": usage}
+				_ = sseSafeRaw(w, flusher, "data: "+mustJSON(usageChunk)+"\n\n")
+			}
+			finish := map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}
+			_ = sseSafeRaw(w, flusher, "data: "+mustJSON(finish)+"\n\n")
+			_ = sseSafeRaw(w, flusher, "data: [DONE]\n\n")
+			return nil
+		}
+		jsonOut(w, map[string]any{"id": id, "object": "chat.completion", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": "stop"}}, "m365": compatM365Metadata(res), "usage": usage})
+		return nil
+	}
 	toolCalls := toolCallMaps(calls)
 	msg := map[string]any{"role": "assistant", "content": nil, "tool_calls": toolCalls}
 	if res.Reasoning != "" {
