@@ -29,13 +29,16 @@ fi
 
 git fetch origin main --quiet 2>>"$LOG" || { log "ERROR: git fetch failed"; exit 1; }
 
-HEAD_LOCAL=$(git rev-parse HEAD)
+# Deployment fingerprint: the commit the CURRENT BINARY was built from.
+# HEAD==origin/main is NOT enough (local push/manual build can make the
+# tree match while the binary is stale). Only the fingerprint decides.
 HEAD_REMOTE=$(git rev-parse origin/main)
-if [ "$HEAD_LOCAL" = "$HEAD_REMOTE" ]; then
-    exit 0 # up to date, silent no-op
+DEPLOYED=$(cat "$DATA/deployed.commit" 2>/dev/null || true)
+if [ -n "$DEPLOYED" ] && [ "$DEPLOYED" = "$HEAD_REMOTE" ]; then
+    exit 0 # binary already built from this commit, silent no-op
 fi
 
-log "DEPLOY: $HEAD_LOCAL -> $HEAD_REMOTE ($(git log --oneline -1 origin/main))"
+log "DEPLOY: deployed=$DEPLOYED -> $HEAD_REMOTE ($(git log --oneline -1 origin/main))"
 
 git merge --ff-only origin/main >>"$LOG" 2>&1 || { log "ERROR: ff merge failed"; exit 1; }
 
@@ -75,3 +78,4 @@ if [ "$(systemctl is-active "$SVC")" != "active" ]; then
 fi
 
 log "OK: deployed $(git rev-parse HEAD), service active"
+echo "$(git rev-parse HEAD)" > "$DATA/deployed.commit"
