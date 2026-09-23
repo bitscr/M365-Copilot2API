@@ -175,6 +175,7 @@ type Server struct {
 	generatedImages      map[string]generatedImage
 	convCache            *conversationCache
 	lastHealthyAccount   string
+	localExec            *LocalExecutor
 }
 
 const maxResponsesPerTenant = 256
@@ -270,6 +271,7 @@ func New() (*Server, error) {
 		usage:                openUsageLog(),
 		generatedImages:      map[string]generatedImage{},
 		convCache:            newConversationCache(),
+		localExec:            NewLocalExecutorFromEnv(),
 	}, nil
 }
 
@@ -3080,8 +3082,16 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
 				calls = calls[:1]
 			}
-			_ = writeToolResponse(w, id, model, body.Stream, body.shouldSendStreamUsage(), calls, res)
-			return
+			if res2, execLedger, ok := s.tryLocalExecute(ctx, requestID, acc.ID, account, &body, calls, tone, body.Attachments, res.ConversationID, res.SessionID); ok {
+				res = res2
+				ledger = execLedger
+				if res2.ConversationID != "" {
+					s.bindConversation(acc, &body, r, res2, prompt, startedAt)
+				}
+			} else {
+				_ = writeToolResponse(w, id, model, body.Stream, body.shouldSendStreamUsage(), calls, res)
+				return
+			}
 		}
 	}
 	if rawCalls := nativeToolCalls(res.Events, body.Tools); len(rawCalls) > 0 {
@@ -3092,8 +3102,16 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
 				calls = calls[:1]
 			}
-			_ = writeToolResponse(w, id, model, body.Stream, body.shouldSendStreamUsage(), calls, res)
-			return
+			if res2, execLedger, ok := s.tryLocalExecute(ctx, requestID, acc.ID, account, &body, calls, tone, body.Attachments, res.ConversationID, res.SessionID); ok {
+				res = res2
+				ledger = execLedger
+				if res2.ConversationID != "" {
+					s.bindConversation(acc, &body, r, res2, prompt, startedAt)
+				}
+			} else {
+				_ = writeToolResponse(w, id, model, body.Stream, body.shouldSendStreamUsage(), calls, res)
+				return
+			}
 		}
 	}
 	// Recover natural-language tool intent in native mode, and repair any
