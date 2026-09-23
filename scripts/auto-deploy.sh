@@ -16,6 +16,7 @@ SVC=m365-api.service
 # "module cache not found" 并把刚推送的提交 reset 掉。
 export GOMODCACHE=/root/go/pkg/mod
 export GOPATH=/root/go
+export GOCACHE=/root/.cache/go-build
 
 log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
 
