@@ -215,8 +215,8 @@ func isImageLimitNotice(text string) bool {
 }
 
 var sandboxHallucinationPatterns = []string{
-	"I can run that for you",
-	"I'll run that",
+	"i can run that for you",
+	"i'll run that",
 	"let me run that",
 	"let me execute",
 	"running in sandbox",
@@ -300,6 +300,79 @@ func isSandboxHallucination(text string) bool {
 	low := strings.ToLower(text)
 	for _, p := range sandboxHallucinationPatterns {
 		if strings.Contains(low, strings.ToLower(p)) {
+			return true
+		}
+	}
+	return false
+}
+
+// externalAccessSignals are phrases that indicate the upstream model tried to
+// reach an external resource itself (a URL, a git repo, a web page) instead of
+// calling one of the caller's tools. Alone they are benign — the model may
+// legitimately mention git or a project address.
+var externalAccessSignals = []string{
+	"git clone",
+	"克隆仓库",
+	"下载 github",
+	"下载 zip",
+	"下载仓库",
+	"浏览器访问",
+	"打开链接",
+	"打开网址",
+	"curl ",
+	"wget ",
+	"git pull",
+	"git fetch",
+	"访问该项目",
+	"访问项目",
+	"访问 github",
+}
+
+// externalAccessFailures are the "I tried but the environment failed" claims.
+// Combined with a signal they form the third sandbox-hallucination shape: the
+// model pretending it attempted an external fetch inside its own cloud
+// container and reporting an environment-limited failure ("git clone timed
+// out", "download got nothing in 60s", "no Chromium"). With tools declared
+// this must eject — the model should have called a tool instead of trying
+// itself. Without tools an honest "cannot access" is the desired answer, so
+// this check is only armed by executionEjectTrigger when toolMaps > 0.
+// The failure words are deliberately concrete: generic words like "失败" or
+// "不可用" alone would eject benign analytical sentences about git usage.
+var externalAccessFailures = []string{
+	"超时",
+	"timeout",
+	"连接失败",
+	"无法访问",
+	"访问失败",
+	"缺少 chromium",
+	"没有 chromium",
+	"no chromium",
+	"未收到数据",
+	"下载失败",
+	"未能下载",
+	"无法下载",
+	"60 秒",
+	"60s",
+}
+
+// isExternalAccessClaim reports whether the text pairs an external-access
+// attempt with a failure/environment-limited outcome. The pair requirement
+// keeps false positives out: a plain mention of "git clone" or "timeout" in a
+// tutorial or config answer never trips this.
+func isExternalAccessClaim(text string) bool {
+	low := strings.ToLower(text)
+	signal := false
+	for _, s := range externalAccessSignals {
+		if strings.Contains(low, s) {
+			signal = true
+			break
+		}
+	}
+	if !signal {
+		return false
+	}
+	for _, f := range externalAccessFailures {
+		if strings.Contains(low, f) {
 			return true
 		}
 	}
@@ -441,7 +514,7 @@ func executionIntent(text string) bool {
 // flows through, while fake container output is dropped.
 func executionEjectTrigger(text string, toolMaps []map[string]any) bool {
 	if len(toolMaps) > 0 {
-		return isToolRefusal(text) || isSandboxHallucination(text)
+		return isToolRefusal(text) || isSandboxHallucination(text) || isExternalAccessClaim(text)
 	}
 	return isSandboxClaim(text)
 }

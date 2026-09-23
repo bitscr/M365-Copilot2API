@@ -157,3 +157,67 @@ func TestEjectCorrectionForPicksPerTools(t *testing.T) {
 		t.Errorf("no-tool correction wrong: %.120s", c)
 	}
 }
+
+// TestExternalAccessClaimDetectsFailedGitHubFetch is the regression test for
+// the intermittent "cannot access project address but tools are fine, new
+// channel works" symptom. The upstream model, despite 25 declared tools,
+// tried to reach GitHub from inside its own container and reported failures
+// ("git clone timeout", "ZIP download got nothing in 60s", "no Chromium")
+// instead of calling a tool. That third sandbox-hallucination shape must be
+// ejected when tools are declared.
+func TestExternalAccessClaimDetectsFailedGitHubFetch(t *testing.T) {
+	tools := []map[string]any{{"type": "function", "function": map[string]any{"name": "bash"}}}
+	variants := []string{
+		"我目前仍无法读取 webssh 项目的源码。尝试的访问路径都失败了:浏览器访问:运行环境缺少 Chromium;git clone:连接超时;下载 GitHub ZIP:60 秒内未收到数据。",
+		"git clone:连接超时,无法访问 github 仓库,因此不能负责任地编造项目逻辑。",
+		"I tried to clone the repo but git clone timed out and the download failed after 60s; the environment lacks Chromium for browser access.",
+		"无法访问项目地址:下载失败,网页搜索能力不可用,离线知识不足以确认源码状态。",
+	}
+	for _, v := range variants {
+		if !isExternalAccessClaim(v) {
+			t.Errorf("external-access claim not detected: %.100s", v)
+		}
+		if !executionEjectTrigger(v, tools) {
+			t.Errorf("tooled trigger did not fire for external-access claim: %.100s", v)
+		}
+	}
+}
+
+// TestExternalAccessClaimAllowsHonestNoToolAnswer verifies that with NO tools
+// declared, an honest "cannot access / clone failed" answer is the DESIRED
+// behavior and must never eject (it is a truthful refusal, not a container
+// hallucination).
+func TestExternalAccessClaimAllowsHonestNoToolAnswer(t *testing.T) {
+	honest := []string{
+		"当前请求没有附加任何执行工具,我无法访问 GitHub 项目,请在本地执行 git clone 后把文件发给我。",
+		"没有提供工具,我无法下载该仓库。你可以用 git clone 在本地获取。",
+		"无法访问项目地址,因为没有附加任何工具。",
+	}
+	for _, v := range honest {
+		if executionEjectTrigger(v, nil) {
+			t.Errorf("honest no-tool answer must not eject: %q", v)
+		}
+	}
+}
+
+// TestExternalAccessClaimIgnoresBenignMentions ensures ordinary mentions of
+// git, timeouts, or project URLs in analytical answers never eject even when
+// tools are declared.
+func TestExternalAccessClaimIgnoresBenignMentions(t *testing.T) {
+	tools := []map[string]any{{"type": "function", "function": map[string]any{"name": "bash"}}}
+	benign := []string{
+		"该项目地址是 https://github.com/foo/bar,建议用 git clone 在本地拉取。",
+		"连接超时是常见的网络配置问题,可以调整 timeout 参数。",
+		"git clone 的用法:git clone <url>,失败时可检查网络。",
+		"浏览器访问该网站需要 Chromium 内核。",
+		"网页搜索不可用时,可以尝试直接访问网址。",
+	}
+	for _, v := range benign {
+		if isExternalAccessClaim(v) {
+			t.Errorf("benign mention falsely ejected: %q", v)
+		}
+		if executionEjectTrigger(v, tools) {
+			t.Errorf("benign mention falsely ejected via trigger: %q", v)
+		}
+	}
+}
