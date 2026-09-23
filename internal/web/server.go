@@ -2139,8 +2139,16 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				s.storeConvCache(tenant, acc.ID, convCacheModel, toolRes, tone, body.Messages, convReused)
 				w.Header().Set(sessionHeaderName, toolRes.SessionID)
 			}
-			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, body.shouldSendStreamUsage(), calls, toolRes)
-			return
+			if res2, execLedger, ok := s.tryLocalExecute(ctx, requestID, acc.ID, account, &body, calls, tone, body.Attachments, toolRes.ConversationID, toolRes.SessionID); ok {
+				toolRes = res2
+				ledger = execLedger
+				if res2.ConversationID != "" {
+					s.bindConversation(acc, &body, r, res2, answerPrompt, startedAt)
+				}
+			} else {
+				_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, body.shouldSendStreamUsage(), calls, toolRes)
+				return
+			}
 		}
 		// No tool was selected: the router decision conversations are
 		// throwaway — drop them so the cloud list does not accumulate one
@@ -2588,6 +2596,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				s.bindConversation(acc, &body, r, toolRes, answerPrompt, startedAt)
 				s.storeConvCache(tenant, acc.ID, convCacheModel, toolRes, tone, body.Messages, convReused)
 				w.Header().Set(sessionHeaderName, toolRes.SessionID)
+			}
+			if res2, execLedger, ok := s.tryLocalExecute(ctx, requestID, acc.ID, account, &body, calls, tone, body.Attachments, toolRes.ConversationID, toolRes.SessionID); ok {
+				ledger = execLedger
+				if res2.ConversationID != "" {
+					s.bindConversation(acc, &body, r, res2, answerPrompt, startedAt)
+				}
+				// Stream the locally-executed follow-up result to the client.
+				_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, body.shouldSendStreamUsage(), nil, res2)
+				return
 			}
 			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, body.shouldSendStreamUsage(), calls, toolRes)
 			return
@@ -3134,6 +3151,14 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 				}
 				calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
+				if res2, execLedger, ok := s.tryLocalExecute(ctx, requestID, acc.ID, account, &body, calls, tone, body.Attachments, routeRes.ConversationID, routeRes.SessionID); ok {
+					ledger = execLedger
+					if res2.ConversationID != "" {
+						s.bindConversation(acc, &body, r, res2, answerPrompt, startedAt)
+					}
+					_ = writeToolResponse(w, id, model, body.Stream, body.shouldSendStreamUsage(), nil, res2)
+					return
+				}
 				_ = writeToolResponse(w, id, model, body.Stream, body.shouldSendStreamUsage(), calls, routeRes)
 				return
 			}
