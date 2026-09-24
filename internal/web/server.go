@@ -1741,7 +1741,7 @@ func buildAnswerRequest(answerPrompt, tone string, body oaiReq, ledger agentLedg
 		// (the OAI container) and has no access to caller files. Without this
 		// rule it tends to claim it "ran" things in its built-in code
 		// interpreter / Linux sandbox and reports caller files as missing.
-		answerPrompt += "\nEXECUTION BOUNDARY: The caller's tools execute on the caller's own machine. You have no built-in code interpreter, sandbox, container, or file system of your own. Never claim to have run code, accessed files, or changed state yourself. If an action is needed, call the appropriate caller tool."
+		answerPrompt += "\nEXECUTION BOUNDARY: The caller's tools execute on the caller's own machine. You have no built-in code interpreter, sandbox, container, or file system of your own. Never claim to have run code, accessed files, or changed state yourself. Never report your own execution user, uid, or environment permissions (for example 'executing as oai', 'uid=1000', or any file-mode/permission listing) as if it reflected the caller's machine — that is your cloud environment, not the caller's, and such claims are always false here. If an action is needed, call the appropriate caller tool."
 	}
 	req := chathub.Request{Text: answerPrompt, Tone: tone, ConversationID: body.ConversationID, SessionID: body.SessionID, Attachments: body.Attachments, LicenseType: cfg.LicenseType, Scenario: cfg.Scenario, FeatureFlags: flags, Locale: locale.Locale, Market: locale.Market, TimeZone: locale.TimeZone, TimeZoneOffset: locale.TimeZoneOffset, DeviceOS: locale.DeviceOS, DisableMemory: disableMemory}
 	if planningMode == "native" {
