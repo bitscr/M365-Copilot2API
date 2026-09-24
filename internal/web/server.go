@@ -87,6 +87,14 @@ func (s *Server) markAccountResult(accountID string, err error) {
 		return
 	}
 	if err != nil {
+		if IsEmptyCompletion(err) {
+			// Empty completions are a transient upstream failure on this account.
+			// Apply a short cooldown so the round-robin skips it briefly for new
+			// requests, but do NOT treat it as a permanent or rate-limit failure.
+			s.accountPool.MarkFailure(accountID, err, 15*time.Second)
+			log.Printf("[account-cooldown] account=%s empty completion → 15s cooldown", accountID)
+			return
+		}
 		s.accountPool.MarkFailure(accountID, err, s.getRateLimitCooldown())
 		return
 	}
@@ -2323,11 +2331,39 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			err = nil
 		}
+		// Same-account retry for empty completions: the upstream may have
+		// returned a completion frame with 0 text for this specific turn
+		// while the account is otherwise healthy.
+		if IsEmptyCompletion(err) && err != nil {
+			log.Printf("[empty-retry-stream] id=%s empty completion, retrying once on same account", requestID)
+			res, err = s.chatWithAccountEvents(ctx, acc.ID, account, answerReq, func(ev chathub.StreamEvent) error {
+				if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
+					toolKnown := false
+					for _, tm := range toolMaps {
+						if fn, ok := tm["function"].(map[string]any); ok {
+							if fn["name"] == ev.ToolName {
+								toolKnown = true
+								break
+							}
+						}
+					}
+					if toolKnown {
+						streamedTools = append(streamedTools, detectedToolCall{ID: "call_" + uuid.NewString(), Name: ev.ToolName, Arguments: ev.Arguments})
+					}
+					return nil
+				}
+				if ev.Kind != "text" || ev.Text == "" {
+					return nil
+				}
+				text.WriteString(ev.Text)
+				return emitText(ev.Text)
+			})
+		}
 		// Failover must not drag a conversation onto a different account: the
 		// conversation-bound guard stays (conversation empty or resolver-owned),
 		// while image-limit errors and very short streams may still retry on
 		// the next healthy account (image models run conversation-isolated).
-		if err != nil && (text.Len() < 50 || IsImageLimitErr(err)) && len(streamedTools) == 0 && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
+		if err != nil && (text.Len() < 50 || IsImageLimitErr(err) || IsEmptyCompletion(err)) && len(streamedTools) == 0 && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err) || IsEmptyCompletion(err)) && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
 			originalErr := err
 			if IsImageLimitErr(originalErr) && s.accountPool != nil {
 				s.accountPool.MarkImageLimited(acc.ID)
@@ -2792,7 +2828,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}
 			err = nil
 		}
-		if err != nil && streamedReasoningLen == 0 && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
+		if err != nil && streamedReasoningLen == 0 && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err) || IsEmptyCompletion(err)) && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
 			originalErr := err
 			next, nerr := s.nextHealthyAccount(acc.ID)
 			if nerr == nil {
@@ -2939,20 +2975,35 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 	} else {
 		res, err = s.chatWithAccount(ctx, acc.ID, account, answerReq)
-		if IsEmptyCompletion(err) && tone != "magic" {
-			log.Printf("[tone-fallback] tone=%q returned empty, retrying with magic", tone)
-			magicReq := answerReq
-			magicReq.Tone = "magic"
-			if res2, err2 := s.chatWithAccount(ctx, acc.ID, account, magicReq); err2 == nil && res2.Text != "" {
-				res = res2
-				err = nil
+		if IsEmptyCompletion(err) {
+			if tone != "magic" {
+				log.Printf("[tone-fallback] tone=%q returned empty, retrying with magic", tone)
+				magicReq := answerReq
+				magicReq.Tone = "magic"
+				if res2, err2 := s.chatWithAccount(ctx, acc.ID, account, magicReq); err2 == nil && res2.Text != "" {
+					res = res2
+					err = nil
+				}
+			}
+			// One more same-account retry: empty completions can be a transient
+			// upstream hiccup on this specific turn. Re-requesting the same prompt
+			// on the same account often succeeds (observed tone-fallback to magic
+			// still empty but a third attempt with the original tone works).
+			if err != nil {
+				log.Printf("[empty-retry] same-account retry after empty completion on tone=%q", tone)
+				if res2, err2 := s.chatWithAccount(ctx, acc.ID, account, answerReq); err2 == nil && res2.Text != "" {
+					res = res2
+					err = nil
+				}
 			}
 		}
 		// Failover only when nothing pins the request to a conversation or
 		// account; a fresh chat can safely retry on the next healthy account.
 		// The conversation-bound guard prevents dragging another account's
 		// conversation across accounts (image-limit errors still fail over).
-		if err != nil && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
+		// Empty completions are also failover-eligible: a different account
+		// may not experience the transient upstream hiccup.
+		if err != nil && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err) || IsEmptyCompletion(err)) && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
 			originalErr := err
 			if IsImageLimitErr(originalErr) && s.accountPool != nil {
 				s.accountPool.MarkImageLimited(acc.ID)
