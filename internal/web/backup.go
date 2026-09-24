@@ -31,6 +31,26 @@ type backupFile struct {
 	path string // 磁盘路径，与所属 store 同规则解析
 }
 
+func usageFilePath() string {
+	if p := strings.TrimSpace(os.Getenv("M365_USAGE_LOG")); p != "" {
+		return p
+	}
+	dir := strings.TrimSpace(os.Getenv("M365_DATA_DIR"))
+	if dir == "" {
+		h, _ := os.UserHomeDir()
+		dir = filepath.Join(h, ".config", "m365-copilot2api")
+	}
+	return filepath.Join(dir, "usage.jsonl")
+}
+
+func statsFilePath() string {
+	if dir := strings.TrimSpace(os.Getenv("M365_DATA_DIR")); dir != "" {
+		return filepath.Join(dir, "stats.json")
+	}
+	h, _ := os.UserHomeDir()
+	return filepath.Join(h, ".config", "m365-copilot2api", "stats.json")
+}
+
 func backupFiles() []backupFile {
 	home, _ := os.UserHomeDir()
 	confDir := filepath.Join(home, ".config", "m365-copilot2api")
@@ -47,6 +67,8 @@ func backupFiles() []backupFile {
 		{"sessions.json", resolve("M365_SESSION_CACHE", filepath.Join(confDir, "sessions.json"))},
 		{"active-sessions.json", activeSessionCachePath()},
 		{"conversations.json", resolve("M365_CONVERSATION_CACHE", filepath.Join(confDir, "conversations.json"))},
+		{"usage.jsonl", usageFilePath()},
+		{"stats.json", statsFilePath()},
 	}
 }
 
@@ -122,6 +144,7 @@ type backupImportSummary struct {
 	Sessions      int      `json:"sessions"`
 	Messages      int      `json:"messages"`
 	Conversations int      `json:"conversations"`
+	UsageRecords  int      `json:"usage_records"`
 	Restart       string   `json:"restart"`
 	Warnings      []string `json:"warnings"`
 }
@@ -262,13 +285,15 @@ func (s *Server) adminImportBackup(w http.ResponseWriter, r *http.Request) {
 			case "sessions.json":
 				summary.Sessions = countBackupJSON(f.name, c)
 				summary.Messages = countBackupMessages(c)
+			case "usage.jsonl":
+				summary.UsageRecords = countBackupJSON(f.name, c)
 			}
 		}
 	}
 	summary.RotatedTo = rotated
 	summary.Warnings = importWarnings(manifest, entries["accounts.json"])
-	log.Printf("[backup] import applied: %s (accounts=%d keys=%d sessions=%d msgs=%d conversations=%d)",
-		strings.Join(summary.Restored, ","), summary.Accounts, summary.APIKeys, summary.Sessions, summary.Messages, summary.Conversations)
+	log.Printf("[backup] import applied: %s (accounts=%d keys=%d sessions=%d msgs=%d conversations=%d usage=%d)",
+		strings.Join(summary.Restored, ","), summary.Accounts, summary.APIKeys, summary.Sessions, summary.Messages, summary.Conversations, summary.UsageRecords)
 	jsonOut(w, summary)
 	scheduleImportRestart()
 }
@@ -331,6 +356,26 @@ func validateBackupJSON(name string, b []byte) error {
 		if !json.Valid(b) {
 			return fmt.Errorf("admin-password.json is not valid JSON")
 		}
+	case "usage.jsonl":
+		// 每行一个 JSON 对象。
+		for i, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+			l := strings.TrimSpace(line)
+			if l == "" {
+				continue
+			}
+			var rec json.RawMessage
+			if !json.Valid([]byte(l)) {
+				return fmt.Errorf("usage.jsonl line %d is not valid JSON", i+1)
+			}
+			if err := json.Unmarshal([]byte(l), &rec); err != nil {
+				return fmt.Errorf("usage.jsonl line %d: %v", i+1, err)
+			}
+		}
+	case "stats.json":
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(b, &obj); err != nil {
+			return fmt.Errorf("stats.json must be a JSON object")
+		}
 	}
 	return nil
 }
@@ -370,6 +415,14 @@ func countBackupJSON(name string, b []byte) int {
 		if json.Unmarshal(b, &c) == nil {
 			return len(c.Conversations)
 		}
+	case "usage.jsonl":
+		n := 0
+		for _, line := range strings.Split(string(b), "\n") {
+			if strings.TrimSpace(line) != "" {
+				n++
+			}
+		}
+		return n
 	}
 	return 0
 }

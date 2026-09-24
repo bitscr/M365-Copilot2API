@@ -23,6 +23,7 @@ func setupBackupEnv(t *testing.T) string {
 	t.Setenv("M365_API_KEYS", filepath.Join(dir, "api-keys.json"))
 	t.Setenv("M365_SESSION_CACHE", filepath.Join(dir, "sessions.json"))
 	t.Setenv("M365_CONVERSATION_CACHE", filepath.Join(dir, "conversations.json"))
+	t.Setenv("M365_DATA_DIR", dir)
 	t.Setenv("M365_MASTER_KEY", "")
 	seed := map[string]string{
 		"accounts.json":        `{"accounts":[{"email":"a@x.com","refreshToken":"rt1"},{"email":"b@x.com","refreshToken":""}]}`,
@@ -31,6 +32,8 @@ func setupBackupEnv(t *testing.T) string {
 		"sessions.json":        `[{"id":"s1","contextHistory":[{"role":"user","content":"hi"},{"role":"assistant","content":"yo"}]}]`,
 		"active-sessions.json": `{"s1":{"id":"s1"}}`,
 		"conversations.json":   `{"conversations":{"c1":{"id":"c1","title":"t"}}}`,
+		"usage.jsonl":          "{\"time\":\"2026-09-24T00:00:00Z\",\"status\":200}\n",
+		"stats.json":           `{"total_requests":0}`,
 	}
 	for name, content := range seed {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
@@ -101,7 +104,7 @@ func TestBackupExportRoundTrip(t *testing.T) {
 		t.Fatalf("content-disposition = %q", disp)
 	}
 	names := zipNames(t, zipData)
-	for _, want := range []string{"accounts.json", "api-keys.json", "admin-password.json", "sessions.json", "active-sessions.json", "conversations.json", "manifest.json"} {
+	for _, want := range []string{"accounts.json", "api-keys.json", "admin-password.json", "sessions.json", "active-sessions.json", "conversations.json", "usage.jsonl", "stats.json"} {
 		if _, ok := names[want]; !ok {
 			t.Errorf("zip missing %s (have %v)", want, keysOf(names))
 		}
@@ -110,7 +113,7 @@ func TestBackupExportRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(names["manifest.json"], &mf); err != nil {
 		t.Fatalf("manifest unparsable: %v", err)
 	}
-	if mf.Version != backupManifestVersion || len(mf.Files) != 6 {
+	if mf.Version != backupManifestVersion || len(mf.Files) != 8 {
 		t.Fatalf("manifest wrong: %+v", mf)
 	}
 	// 导出内容必须与种子数据一致。
@@ -136,13 +139,13 @@ func TestBackupImportAppliesAndRotates(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &sum); err != nil {
 		t.Fatal(err)
 	}
-	if sum.Status != "imported" || sum.Accounts != 2 || sum.APIKeys != 1 || sum.Sessions != 1 || sum.Messages != 2 || sum.Conversations != 1 {
+	if sum.Status != "imported" || sum.Accounts != 2 || sum.APIKeys != 1 || sum.Sessions != 1 || sum.Messages != 2 || sum.Conversations != 1 || sum.UsageRecords != 1 {
 		t.Fatalf("summary wrong: %+v", sum)
 	}
 	if len(sum.Warnings) == 0 {
 		t.Error("expected a warning for the account missing refreshToken")
 	}
-	if len(sum.Restored) != 6 || len(sum.RotatedTo) != 6 {
+	if len(sum.Restored) != 8 || len(sum.RotatedTo) != 8 {
 		t.Fatalf("restored/rotated counts wrong: %+v / %+v", sum.Restored, sum.RotatedTo)
 	}
 	for _, rot := range sum.RotatedTo {
@@ -228,12 +231,128 @@ func TestBackupImportRejectsZipSlip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 6 {
+	if len(entries) != 8 {
 		names := make([]string, 0, len(entries))
 		for _, e := range entries {
 			names = append(names, e.Name())
 		}
 		t.Fatalf("data dir changed after rejected zip-slip import: %v", names)
+	}
+}
+
+func TestBackupIncludesUsageAndStatsFiles(t *testing.T) {
+	dir := setupBackupEnv(t)
+	usagePath := filepath.Join(dir, "usage.jsonl")
+	statsPath := filepath.Join(dir, "stats.json")
+	// 种子数据不写这两个文件;显式铺进临时目录,验证它们进入备份。
+	seedUsage := "{\"time\":\"2026-09-24T00:00:00Z\",\"api_key_prefix\":\"k\",\"input_tokens\":1,\"output_tokens\":2,\"cache_tokens\":3,\"status\":200}\n" +
+		"{\"time\":\"2026-09-24T01:00:00Z\",\"api_key_prefix\":\"k2\",\"input_tokens\":4,\"output_tokens\":5,\"status\":201}\n"
+	seedStats := `{"total_requests":10,"cache_hits":9,"cache_misses":1}`
+	if err := os.WriteFile(usagePath, []byte(seedUsage), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statsPath, []byte(seedStats), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{}
+	zipData, _ := doExport(t, s)
+	names := zipNames(t, zipData)
+	for _, want := range []string{"usage.jsonl", "stats.json"} {
+		if _, ok := names[want]; !ok {
+			t.Fatalf("zip missing %s (have %v)", want, keysOf(names))
+		}
+	}
+	if string(names["usage.jsonl"]) != seedUsage {
+		t.Errorf("usage.jsonl content mismatch:\n got %q\nwant %q", names["usage.jsonl"], seedUsage)
+	}
+	if string(names["stats.json"]) != seedStats {
+		t.Errorf("stats.json content mismatch:\n got %q\nwant %q", names["stats.json"], seedStats)
+	}
+	var mf backupManifest
+	if err := json.Unmarshal(names["manifest.json"], &mf); err != nil {
+		t.Fatal(err)
+	}
+	if len(mf.Files) != 8 {
+		t.Fatalf("manifest should list 8 files, got %d: %v", len(mf.Files), mf.Files)
+	}
+}
+
+func TestBackupImportRestoresUsageAndReportsCount(t *testing.T) {
+	dir := setupBackupEnv(t)
+	usagePath := filepath.Join(dir, "usage.jsonl")
+	statsPath := filepath.Join(dir, "stats.json")
+	seedUsage := "{\"time\":\"2026-09-24T00:00:00Z\",\"api_key_prefix\":\"k\",\"input_tokens\":1,\"output_tokens\":2,\"status\":200}\n" +
+		"{\"time\":\"2026-09-24T01:00:00Z\",\"api_key_prefix\":\"k2\",\"input_tokens\":4,\"output_tokens\":5,\"status\":201}\n"
+	if err := os.WriteFile(usagePath, []byte(seedUsage), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statsPath, []byte(`{"total_requests":7}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{}
+	orig := scheduleImportRestart
+	scheduleImportRestart = func() {}
+	defer func() { scheduleImportRestart = orig }()
+
+	zipData, _ := doExport(t, s)
+	rec := postImport(t, s, zipData)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("import status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var sum backupImportSummary
+	if err := json.Unmarshal(rec.Body.Bytes(), &sum); err != nil {
+		t.Fatal(err)
+	}
+	if sum.UsageRecords != 2 {
+		t.Fatalf("summary usage_records = %d, want 2 (%+v)", sum.UsageRecords, sum)
+	}
+	if len(sum.Restored) != 8 || len(sum.RotatedTo) != 8 {
+		t.Fatalf("restored/rotated counts wrong: %+v / %+v", sum.Restored, sum.RotatedTo)
+	}
+	for _, name := range []string{"usage.jsonl", "stats.json"} {
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("%s not on disk after import: %v", name, err)
+		}
+		if len(b) == 0 {
+			t.Errorf("%s empty after import", name)
+		}
+	}
+}
+
+func TestBackupImportRejectsMalformedUsageLine(t *testing.T) {
+	dir := setupBackupEnv(t)
+	s := &Server{}
+	orig := scheduleImportRestart
+	scheduleImportRestart = func() {}
+	defer func() { scheduleImportRestart = orig }()
+
+	before := readAllDataFiles(t, dir)
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, f := range backupFiles() {
+		b, err := os.ReadFile(f.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fw, _ := zw.Create(f.name)
+		fw.Write(b)
+	}
+	fw, _ := zw.Create("usage.jsonl")
+	fw.Write([]byte(`{"time":"x","status":200}` + "\n" + `this is not json` + "\n"))
+	mb, _ := json.Marshal(backupManifest{Version: backupManifestVersion, ExportedAt: "x", Files: []string{"usage.jsonl"}})
+	mfw, _ := zw.Create("manifest.json")
+	mfw.Write(mb)
+	zw.Close()
+
+	rec := postImport(t, s, buf.Bytes())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for malformed usage line, got %d: %s", rec.Code, rec.Body.String())
+	}
+	after := readAllDataFiles(t, dir)
+	if !bytes.Equal(before["sessions.json"], after["sessions.json"]) {
+		t.Error("disk changed despite rejected import")
 	}
 }
 
@@ -260,7 +379,7 @@ func TestBackupExportSkipsMissingFiles(t *testing.T) {
 func readAllDataFiles(t *testing.T, dir string) map[string][]byte {
 	t.Helper()
 	out := map[string][]byte{}
-	for _, name := range []string{"accounts.json", "api-keys.json", "admin-password.json", "sessions.json", "active-sessions.json", "conversations.json"} {
+	for _, name := range []string{"accounts.json", "api-keys.json", "admin-password.json", "sessions.json", "active-sessions.json", "conversations.json", "usage.jsonl", "stats.json"} {
 		b, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			t.Fatal(err)
