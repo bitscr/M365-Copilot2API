@@ -292,15 +292,29 @@ python manage.py stop     # 停止服务
 
 ## 配置说明
 
-全部通过环境变量配置，也可以用 `.env.example` 作为起点。
+全部通过环境变量配置,也可以用 `.env.example` 作为起点。
 
-控制台「Settings」页可修改**监听地址**等重启项，且**控制台保存的值优先于环境变量**：保存后点击保存会自动重启服务（systemd 环境用安装时的 unit 执行 `systemctl restart`，容器环境依赖重启策略，其他环境原地重新执行二进制）以应用新端口。若希望环境变量反向压过控制台（例如共享主机上硬性锁定绑定地址），设 `M365_SETTINGS_ENV_WINS=true`。
+控制台「Settings」页可修改**监听地址**等重启项,且**控制台保存的值优先于环境变量**:保存后点击保存会自动重启服务(systemd 环境用安装时的 unit 执行 `systemctl restart`,容器环境依赖重启策略,其他环境原地重新执行二进制)以应用新端口。若希望环境变量反向压过控制台(例如共享主机上硬性锁定绑定地址),设 `M365_SETTINGS_ENV_WINS=true`。
+
+### 本仓库 Linux systemd 部署(缺省)
+
+`/etc/m365-copilot2api/env`(EnvironmentFile)示例:
+
+```
+M365_LISTEN=127.0.0.1:42731
+M365_DATA_DIR=/var/lib/m365-copilot2api
+M365_LOG_LEVEL=info
+M365_CONFIG=/var/lib/m365-copilot2api/accounts.json
+```
+
+- 监听 `127.0.0.1:42731`,仅本机可访问;如需对局域网/公网开放改为 `0.0.0.0:42731`(务必前置 TLS 反代)。
+- **不要设置 `M365_SETTINGS_ENV_WINS`**:默认缺省即「控制台优先于环境变量」;一旦设为 `true` 会锁死监听地址,在控制台改端口无效。
 
 ### 核心
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `M365_LISTEN` | `0.0.0.0:4141` | 监听地址，默认全部网卡；设 `127.0.0.1:4141` 仅本机可访问。控制台保存的监听地址优先于它 |
+| `M365_LISTEN` | `0.0.0.0:4141` | 监听地址,默认全部网卡;设 `127.0.0.1:42731` 仅本机可访问。控制台保存的监听地址优先于它 |
 | `M365_SETTINGS_ENV_WINS` | `false` | 设为 `true` 时恢复「环境变量优先于控制台」的旧行为 |
 | `M365_ADMIN_PASSWORD` | `admin123` | 管理员密码（首次登录强制修改） |
 | `M365_DATA_DIR` | `~/.config/m365-copilot2api` | 数据目录（token、密钥、用量等集中存储；`manage.py` 内置为 `data/`） |
