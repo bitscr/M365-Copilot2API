@@ -44,7 +44,13 @@ type conversationPersist struct {
 }
 
 func openConversationManager() *conversationManager {
-	mode := CleanupAfterResponse
+	// 默认 CleanupOnExit = 不做"用完即删"。
+	// 历史教训:此默认值曾是 CleanupAfterResponse,而该分支把闲置超过
+	// 30s 的对话全部删除——每次响应结束都触发一次 Cleanup,于是云端
+	// 对话存活期只有几十秒,会话复用永远命中不了(表现为"列表刷新就
+	// 空了""同一轮对话每次都在换账号")。会话即缓存条目,其生命周期由
+	// auto_cleanup 的闲置窗口(2h)+ keepN 统一管理,不在请求路径上回收。
+	mode := CleanupOnExit
 	if v := os.Getenv("M365_CLEANUP_MODE"); v != "" {
 		mode = ConversationCleanupMode(v)
 	}

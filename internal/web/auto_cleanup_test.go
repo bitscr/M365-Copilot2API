@@ -290,3 +290,37 @@ func TestBindConversationCleanupUnbindsDeadSessions(t *testing.T) {
 		t.Error("new conversation binding must survive cleanup")
 	}
 }
+
+// TestDefaultCleanupModeDoesNotReapIdleConversations guards the regression that
+// made cloud conversations live ~30s: the default mode used to be
+// CleanupAfterResponse, whose branch deletes every conversation idle longer
+// than 30s — and bindConversation calls Cleanup() after EVERY response. Session
+// reuse could therefore never hit (list emptied on refresh, every turn
+// round-robined to a new account). The default must not be after_response, and
+// a conversation touched 45s ago must survive a default-mode Cleanup().
+func TestDefaultCleanupModeDoesNotReapIdleConversations(t *testing.T) {
+	t.Setenv("M365_CLEANUP_MODE", "")
+	s := newTestServerForAutoCleanup(t)
+
+	if got := s.conversationManager.Mode(); got == CleanupAfterResponse {
+		t.Fatalf("default cleanup mode must not be after_response (got %q)", got)
+	}
+	if s.conversationManager.ShouldCleanup() {
+		t.Fatalf("default mode %q must not trigger request-path cleanup", s.conversationManager.Mode())
+	}
+
+	s.conversationManager.Record("conv-idle-45s", "acc1", "idle 45s")
+	cm := s.conversationManager
+	cm.mu.Lock()
+	entry := cm.data["conv-idle-45s"]
+	entry.LastUsedAt = time.Now().UTC().Add(-45 * time.Second)
+	cm.data["conv-idle-45s"] = entry
+	cm.mu.Unlock()
+
+	if cleaned := cm.Cleanup(); len(cleaned) != 0 {
+		t.Fatalf("default mode reaped a 45s-idle conversation: %v", cleaned)
+	}
+	if _, ok := cm.data["conv-idle-45s"]; !ok {
+		t.Fatal("conversation idle 45s must survive default-mode cleanup")
+	}
+}
