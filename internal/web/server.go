@@ -183,6 +183,20 @@ type Server struct {
 	generatedImages      map[string]generatedImage
 	convCache            *conversationCache
 	lastHealthyAccount   string
+
+	// retryDedup 短期去重:相同 key + 相同 body 的重试不重开对话,
+	// 复用首次请求绑定的 conversation/session/account,避免"同一请求
+	// 重试导致云端一坨重复对话、账号轮换"。窗口 60s,键含租户,
+	// 仅对无显式 conversationId 的请求生效。
+	retryDedupMtx sync.Mutex
+	retryDedup    map[string]retryDedupEntry
+}
+
+type retryDedupEntry struct {
+	ConversationID string
+	SessionID      string
+	AccountID      string
+	At             time.Time
 }
 
 const maxResponsesPerTenant = 256
@@ -278,6 +292,7 @@ func New() (*Server, error) {
 		usage:                openUsageLog(),
 		generatedImages:      map[string]generatedImage{},
 		convCache:            newConversationCache(),
+		retryDedup:           map[string]retryDedupEntry{},
 	}, nil
 }
 
@@ -1817,6 +1832,20 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	body.ConversationID = firstNonEmpty(body.ConversationID, body.ConversationIDC)
 	body.SessionID = firstNonEmpty(body.SessionID, body.SessionIDC)
 	log.Printf("[req-trace] id=%s stage=body_parsed messages=%d tools=%d choice=%s raw_bytes=%d", requestID, len(body.Messages), len(body.Tools), normalizedToolChoiceMode(body.ToolChoice), len(raw))
+	// Retry dedup: a byte-identical retry within the window (client retries
+	// after "no reply" / upstream empty completion) must reuse the pinned
+	// conversation+account instead of opening a fresh cloud conversation on
+	// the next round-robin account — previously created 2-3 identical
+	// conversations on different accounts for one logical request.
+	reqTenant := tenantFromRequest(r)
+	if body.ConversationID == "" && len(body.Messages) > 1 && (body.Metadata == nil || !body.Metadata.CopilotTempSession) {
+		if e, ok := s.lookupRetry(reqTenant, body.Messages); ok {
+			body.ConversationID = e.ConversationID
+			body.SessionID = e.SessionID
+			body.AccountID = firstNonEmpty(body.AccountID, e.AccountID)
+			log.Printf("[retry-dedup] id=%s matched conversation=%s account=%s (reusing pinned conversation for retry)", requestID, e.ConversationID[:8], e.AccountID[:8])
+		}
+	}
 	if err := validateToolConversation(body.Messages); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "tool_protocol_error", err.Error())
 		return
@@ -3454,6 +3483,11 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 	}
 
 	apiKey := extractAPIKey(r)
+	// Record a dedup mapping so a byte-identical retry within the window
+	// reuses this conversation instead of opening a fresh one on another
+	// account (observed: client retries after "no reply" create 2-3
+	// identical cloud conversations on different accounts).
+	s.rememberRetry(tenantFromRequest(r), body, res, acc)
 	historyTokens := int64(0)
 	upper := len(body.Messages) - 1
 	if upper < 0 {
@@ -3486,6 +3520,67 @@ func extractAPIKey(r *http.Request) string {
 		return key[:8] + "..."
 	}
 	return key
+}
+
+func (s *Server) rememberRetry(tenant string, body *oaiReq, res chathub.Result, acc auth.AccountToken) {
+	if res.ConversationID == "" || len(body.Messages) == 0 {
+		return
+	}
+	key := retryDedupKey(tenant, body.Messages)
+	s.retryDedupMtx.Lock()
+	defer s.retryDedupMtx.Unlock()
+	// Opportunistic GC of stale entries (window is short; map stays tiny).
+	for k, e := range s.retryDedup {
+		if time.Since(e.At) > 90*time.Second {
+			delete(s.retryDedup, k)
+		}
+	}
+	s.retryDedup[key] = retryDedupEntry{
+		ConversationID: res.ConversationID,
+		SessionID:      res.SessionID,
+		AccountID:      acc.ID,
+		At:             time.Now(),
+	}
+}
+
+// lookupRetry returns the pinned conversation/session/account for a
+// byte-identical retry within the window, or ok=false.
+func (s *Server) lookupRetry(tenant string, messages []oaiMsg) (retryDedupEntry, bool) {
+	if len(messages) == 0 {
+		return retryDedupEntry{}, false
+	}
+	key := retryDedupKey(tenant, messages)
+	s.retryDedupMtx.Lock()
+	defer s.retryDedupMtx.Unlock()
+	e, ok := s.retryDedup[key]
+	if !ok {
+		return retryDedupEntry{}, false
+	}
+	if time.Since(e.At) > 60*time.Second {
+		delete(s.retryDedup, key)
+		return retryDedupEntry{}, false
+	}
+	return e, true
+}
+
+func retryDedupKey(tenant string, messages []oaiMsg) string {
+	// Hash only the last 3 messages (the current turn tail) plus the tenant:
+	// full-history bodies carry UUIDs and timestamps in tool results that
+	// differ between attempts, while the final user turn is what makes a
+	// retry "the same request". The tail is also far cheaper to hash.
+	start := len(messages) - 3
+	if start < 0 {
+		start = 0
+	}
+	h := sha256.New()
+	h.Write([]byte(tenant))
+	for _, m := range messages[start:] {
+		h.Write([]byte(m.Role))
+		h.Write([]byte("\x00"))
+		_ = json.NewEncoder(h).Encode(m)
+	}
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum[:12])
 }
 
 func firstNonEmpty(vals ...string) string {
