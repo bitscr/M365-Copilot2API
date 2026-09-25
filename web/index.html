@@ -315,9 +315,10 @@ body{background:var(--bg);color:var(--text);font-family:"Inter","SF Pro Display"
     <nav class="nav">
       <button data-page="proxies" onclick="showPage('proxies')"><i data-lucide="globe" style="width:16px;height:16px;flex-shrink:0"></i><span>Proxy Pool</span></button>
       <button data-page="modeltest" onclick="showPage('modeltest')"><i data-lucide="flask-conical" style="width:16px;height:16px;flex-shrink:0"></i><span>Model Test</span></button>
+      <button data-page="logs" onclick="showPage('logs')"><i data-lucide="file-text" style="width:16px;height:16px;flex-shrink:0"></i><span>System Logs</span></button>
       <button data-page="settings" onclick="showPage('settings')"><i data-lucide="settings" style="width:16px;height:16px;flex-shrink:0"></i><span>Settings</span></button>
     </nav>
-    <div class="sidebar-foot">v0.4.0</div>
+    <div class="sidebar-foot" id="sidebarVersion">v0.4.0</div>
   </aside>
 
   <main class="main">
@@ -566,6 +567,7 @@ if (response.output_text) {
         <div class="page-head">
           <div><h2 class="page-title">Conversation management</h2><p class="page-sub">View and clean up M365 conversations</p></div>
           <div style="display:flex;gap:8px">
+            <button class="btn" onclick="loadConversations()" title="刷新列表"><i data-lucide="refresh-cw" style="width:14px;height:14px"></i> 刷新</button>
             <button class="btn danger" onclick="cleanupAll()">Clean up all</button>
           </div>
         </div>
@@ -615,6 +617,30 @@ if (response.output_text) {
         </div>
         <div class="card">
           <table class="table"><thead><tr><th>Model</th><th>Status</th><th>Latency</th><th>Reply</th></tr></thead><tbody id="modelTestRows"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody></table>
+        </div>
+      </section>
+
+      <!-- System Logs -->
+      <section id="page-logs" style="display:none">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;gap:12px;flex-wrap:wrap">
+          <div><h2 style="font-size:18px;font-weight:700">Gateway System Logs</h2><p style="font-size:12px;color:var(--muted);margin-top:2px">实时网关控制台日志、底网报错、报错堆栈与 ChatHub WebSocket 追踪</p></div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <input class="form-input" id="sysLogSearch" placeholder="搜索关键字..." style="width:160px" oninput="renderSysLogs()">
+            <select id="sysLogLevel" class="form-input" style="width:110px" onchange="renderSysLogs()">
+              <option value="ALL">全部级别</option>
+              <option value="ERROR">错误 ERROR</option>
+              <option value="WARN">警告 WARN</option>
+              <option value="INFO">信息 INFO</option>
+              <option value="DEBUG">调试 DEBUG</option>
+            </select>
+            <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" id="sysLogAutoRefresh" checked onchange="toggleSysLogAutoRefresh()"> 自动刷新</label>
+            <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" id="sysLogAutoScroll" checked> 滚动锁定</label>
+            <button class="btn" onclick="fetchSysLogs(true)"><i data-lucide="refresh-cw" style="width:14px;height:14px"></i> 刷新</button>
+            <button class="btn danger" onclick="clearSysLogs()"><i data-lucide="trash-2" style="width:14px;height:14px"></i> 清空</button>
+          </div>
+        </div>
+        <div style="background:#0f172a;color:#f8fafc;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;line-height:1.65;padding:16px;border-radius:12px;height:560px;overflow-y:auto;border:1px solid #1e293b;box-shadow:var(--shadow)" id="sysLogConsole">
+          <div style="color:#64748b;font-style:italic">正在连接系统日志缓冲区...</div>
         </div>
       </section>
 
@@ -776,7 +802,7 @@ async function safeCopy(text) {
 }
 
 const $=id=>document.getElementById(id);
-const pages={dashboard:'Dashboard',usage:'Usage',accounts:'Accounts',apikeys:'API Keys',conversations:'Conversations',proxies:'Proxy Pool',modeltest:'Model Test',settings:'Settings'};
+const pages={dashboard:'Dashboard',usage:'Usage',accounts:'Accounts',apikeys:'API Keys',conversations:'Conversations',proxies:'Proxy Pool',modeltest:'Model Test',logs:'System Logs',settings:'Settings'};
 const localeStorageKey='m365_locale';
 const localeSelectionKey='m365_locale_selected';
 const SUPPORTED_LOCALES=['en','zh-CN','zh-TW','ja','ko','es','fr','de','pt-BR','ru','ar'];
@@ -1050,19 +1076,21 @@ function showNotice(msg,type='info'){
 }
 
 function showPage(p){
-  ['dashboard','usage','accounts','apikeys','conversations','proxies','modeltest','settings'].forEach(k=>{
-    $('page-'+k).style.display=k===p?'block':'none';
-    document.querySelector('[data-page="'+k+'"]')?.classList.toggle('active',k===p);
+  ['dashboard','usage','accounts','apikeys','conversations','proxies','modeltest','logs','settings'].forEach(k=>{
+    const el=$('page-'+k);
+    if(el) el.style.display=k===p?'block':'none';
+    document.querySelectorAll('[data-page="'+k+'"]').forEach(btn=>btn.classList.toggle('active',k===p));
   });
-  $('pageTitle').textContent=pages[p];
+  if($('pageTitle')) $('pageTitle').textContent=pages[p]||p;
   if(p==='dashboard'){loadStats();loadOnboarding();loadAccounts();}
-  if(p==='usage')loadUsage();
-  if(p==='accounts')loadAccounts();
-  if(p==='apikeys')loadKeys();
-  if(p==='conversations')loadConversations();
-  if(p==='proxies')loadProxies();
-  if(p==='modeltest')loadModelTest();
-  if(p==='settings')loadSettings();
+  else if(p==='usage')loadUsage();
+  else if(p==='accounts')loadAccounts();
+  else if(p==='apikeys')loadKeys();
+  else if(p==='conversations')loadConversations();
+  else if(p==='proxies')loadProxies();
+  else if(p==='modeltest')loadModelTest();
+  else if(p==='logs')loadLogsPage();
+  else if(p==='settings')loadSettings();
 }
 
 let onboardingHidden=false;
@@ -1123,7 +1151,18 @@ async function logout(){
   location.reload();
 }
 
+async function loadVersion(){
+  try{
+    const d=await api('/api/version');
+    if(d&&d.version){
+      const v=String(d.version).startsWith('v')?d.version:'v'+d.version;
+      if($('sidebarVersion')) $('sidebarVersion').textContent=v;
+    }
+  }catch(e){}
+}
+
 async function loadStats(){
+  loadVersion();
   try{
     const [d,u]=await Promise.all([api('/api/stats'),api('/api/usage?days=365')]);
     const s=d.stats||{};
@@ -1411,17 +1450,126 @@ async function toggleKey(id,revoked){
   catch(e){showNotice(e.message,'error');}
 }
 
-function openKeyModal(){$('keyModal').classList.add('open');$('keyResult').style.display='none';$('keyName').value='default';setTimeout(()=>$('keyName').focus(),50);}
+function openKeyModal(){
+  $('keyModal').classList.add('open');
+  $('keyResult').style.display='none';
+  $('keyName').value='default';
+  const btn = document.querySelector('#keyModal button[type="submit"]');
+  if(btn){ btn.disabled = false; btn.textContent = 'Create'; }
+  setTimeout(()=>$('keyName').focus(),50);
+}
 function closeKeyModal(){$('keyModal').classList.remove('open');}
 async function copyKey(){safeCopy($('keyValue').value);}
 async function createKey(e){
   e.preventDefault();
+  const btn = document.querySelector('#keyModal button[type="submit"]');
+  if(btn){ btn.disabled = true; btn.textContent = '创建中...'; }
   try{
     const d=await api('/api/admin/keys',{method:'POST',body:JSON.stringify({name:$('keyName').value||'default'})});
-    $('keyValue').value=d.key;$('keyResult').style.display='block';copyKey();loadKeys();
-  }catch(e){showNotice(e.message,'error');}
+    $('keyValue').value=d.key;
+    $('keyResult').style.display='block';
+    copyKey();
+    loadKeys();
+    showNotice('API Key 创建成功并已自动复制到剪贴板！','success');
+    if(btn){ btn.disabled = true; btn.textContent = '已创建 Key'; }
+  }catch(err){
+    showNotice(err.message,'error');
+    if(btn){ btn.disabled = false; btn.textContent = 'Create'; }
+  }
 }
 async function revokeKey(id){if(!confirm('确定删除此密钥？'))return;try{await api('/api/admin/keys?id='+id,{method:'DELETE'});loadKeys();}catch(e){showNotice(e.message,'error');}}
+
+let _sysLogsCache = [], _sysLogLastID = 0, _sysLogTimer = null;
+
+async function loadLogsPage(){
+  fetchSysLogs(true);
+  startSysLogAutoRefresh();
+}
+
+function startSysLogAutoRefresh(){
+  if(_sysLogTimer) return;
+  _sysLogTimer = setInterval(()=>{
+    const isVisible = document.visibilityState === 'visible';
+    const isLogsActive = document.getElementById('page-logs')?.style.display !== 'none';
+    const isChecked = $('sysLogAutoRefresh')?.checked;
+    if(isVisible && isLogsActive && isChecked){
+      fetchSysLogs(false);
+    }
+  }, 1500);
+}
+
+function toggleSysLogAutoRefresh(){
+  if($('sysLogAutoRefresh')?.checked){
+    startSysLogAutoRefresh();
+  } else if(_sysLogTimer) {
+    clearInterval(_sysLogTimer);
+    _sysLogTimer = null;
+  }
+}
+
+async function fetchSysLogs(reset=false){
+  try{
+    if(reset){
+      _sysLogLastID = 0;
+      _sysLogsCache = [];
+    }
+    const d = await api('/api/admin/syslogs?since_id=' + _sysLogLastID + '&limit=500');
+    if(d.max_id) _sysLogLastID = d.max_id;
+    if(d.logs && d.logs.length){
+      _sysLogsCache = _sysLogsCache.concat(d.logs);
+      if(_sysLogsCache.length > 2000) _sysLogsCache = _sysLogsCache.slice(_sysLogsCache.length - 2000);
+    }
+    renderSysLogs();
+  }catch(e){
+    const con = $('sysLogConsole');
+    if(con && !_sysLogsCache.length) con.innerHTML = `<div style="color:#f87171">获取日志失败: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderSysLogs(){
+  const con = $('sysLogConsole');
+  if(!con) return;
+  const searchQuery = ($('sysLogSearch')?.value || '').trim().toLowerCase();
+  const selectedLevel = $('sysLogLevel')?.value || 'ALL';
+
+  const list = _sysLogsCache.filter(x => {
+    if(selectedLevel !== 'ALL' && x.level !== selectedLevel) return false;
+    if(searchQuery && !x.message.toLowerCase().includes(searchQuery)) return false;
+    return true;
+  });
+
+  if(!list.length){
+    con.innerHTML = '<div style="color:#64748b;font-style:italic">暂无符合条件的控制台日志</div>';
+    return;
+  }
+
+  con.innerHTML = list.map(x => {
+    const t = new Date(x.time).toLocaleTimeString();
+    let levelColor = '#34d399'; // INFO
+    if(x.level === 'ERROR') levelColor = '#f87171';
+    else if(x.level === 'WARN') levelColor = '#fbbf24';
+    else if(x.level === 'DEBUG') levelColor = '#94a3b8';
+
+    return `<div style="margin-bottom:3px;word-break:break-all"><span style="color:#64748b;margin-right:8px">[${t}]</span><span style="color:${levelColor};font-weight:700;margin-right:8px">[${x.level}]</span><span style="color:#f1f5f9">${esc(x.message)}</span></div>`;
+  }).join('');
+
+  if($('sysLogAutoScroll')?.checked){
+    con.scrollTop = con.scrollHeight;
+  }
+}
+
+async function clearSysLogs(){
+  if(!confirm('确定清空网关底层日志缓冲区？')) return;
+  try{
+    await api('/api/admin/syslogs/clear', {method: 'POST'});
+    _sysLogsCache = [];
+    _sysLogLastID = 0;
+    renderSysLogs();
+    showNotice('底层日志已清空', 'success');
+  }catch(e){
+    showNotice(e.message, 'error');
+  }
+}
 
 // ===== Usage page =====
 let usageDays=7, ugPageNo=0, ugTotal=0;

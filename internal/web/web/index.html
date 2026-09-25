@@ -567,6 +567,7 @@ if (response.output_text) {
         <div class="page-head">
           <div><h2 class="page-title">Conversation management</h2><p class="page-sub">View and clean up M365 conversations</p></div>
           <div style="display:flex;gap:8px">
+            <button class="btn" onclick="loadConversations()" title="刷新列表"><i data-lucide="refresh-cw" style="width:14px;height:14px"></i> 刷新</button>
             <button class="btn danger" onclick="cleanupAll()">Clean up all</button>
           </div>
         </div>
