@@ -144,18 +144,6 @@ Windows 用户直接运行 `m365-copilot2api-windows-amd64.exe` 即可(控制台
 
 ---
 
-## Docker 部署
-
-仓库自带 [Dockerfile](Dockerfile) 与 [docker-compose.yml](docker-compose.yml):
-
-```bash
-docker compose up -d --build
-```
-
-容器监听 `127.0.0.1:4141:4141`,数据卷挂载到 `./data`(程序与数据分离,敏感数据不进镜像)。
-
----
-
 ## License
 
 [MIT](LICENSE)
