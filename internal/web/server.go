@@ -1932,13 +1932,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				body.AccountID = firstNonEmpty(body.AccountID, resolved.AccountID)
 			}
 			log.Printf("[session-resolver] matched=%s conversation=%s history=%d total=%d", resolved.MatchedBy, resolved.ConversationID, resolved.HistoryLen, len(body.Messages))
+			// Plan A: full-context continuation. Sending only the incremental
+			// tail (messages[HistoryLen:]) with a stale ConversationID makes
+			// the upstream M365 open a BRAND-NEW cloud conversation (new ID
+			// returned, old binding orphaned, context lost, account drift).
+			// Keep the complete flattened history in answerPrompt so the
+			// upstream sees the whole thread and continues the same
+			// conversation; HistoryLen remains for logging only.
 			if resolved.HistoryLen > 0 && resolved.HistoryLen < len(body.Messages) {
-				incPrompt, incAtt := flattenPromptMessages(body.Messages[resolved.HistoryLen:], nil)
-				incPrompt = strings.TrimSpace(incPrompt)
-				if incPrompt != "" {
-					answerPrompt = incPrompt
-					body.Attachments = incAtt
-				}
+				log.Printf("[session-resolver] full-context continuation history=%d total=%d", resolved.HistoryLen, len(body.Messages))
 			}
 		}
 	}
@@ -1992,16 +1994,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	if body.ConversationID == "" && len(body.Messages) > 1 &&
 		(body.Metadata == nil || !body.Metadata.CopilotTempSession) {
 		if cached := s.convCache.Lookup(acc.ID, convCacheModel, tenant); convCacheHit(cached, body.Messages) {
-			incPrompt, incAtt := flattenPromptMessages(body.Messages[cached.MessageCount:], nil)
-			incPrompt = strings.TrimSpace(incPrompt)
-			if incPrompt != "" {
-				body.ConversationID = cached.ConversationID
-				body.SessionID = cached.SessionID
-				answerPrompt = incPrompt
-				body.Attachments = incAtt
-				convReused = true
-				log.Printf("[conv-cache] hit tenant=%s account=%s model=%s conversation=%s cached_msgs=%d new_msgs=%d", tenant, acc.ID, convCacheModel, cached.ConversationID, cached.MessageCount, len(body.Messages))
-			}
+			// Plan A: full-context continuation. Do not truncate to the
+			// incremental tail (cached.MessageCount:) — the upstream opens a
+			// new cloud conversation when it receives only new messages with
+			// a stale ConversationID. Send the full thread; the ConversationID
+			// from the cache pins the SAME cloud conversation.
+			body.ConversationID = cached.ConversationID
+			body.SessionID = cached.SessionID
+			convReused = true
+			log.Printf("[conv-cache] hit tenant=%s account=%s model=%s conversation=%s cached_msgs=%d new_msgs=%d (full-context)", tenant, acc.ID, convCacheModel, cached.ConversationID, cached.MessageCount, len(body.Messages))
 		} else if cached != nil {
 			log.Printf("[conv-cache] prefix-mismatch tenant=%s account=%s model=%s cached_msgs=%d new_msgs=%d (no reuse)", tenant, acc.ID, convCacheModel, cached.MessageCount, len(body.Messages))
 		}
