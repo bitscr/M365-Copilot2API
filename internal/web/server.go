@@ -1666,6 +1666,20 @@ func (r *oaiReq) shouldSendStreamUsage() bool {
 
 func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
 
+// isBareNoToolNeeded reports whether resText is exactly the router's
+// "NO_TOOL_NEEDED" stop token with no real answer content — i.e. the model
+// decided no further tool is needed but failed to produce a summary the
+// client could show. Trimmed text must be the bare token (optionally with
+// surrounding whitespace); anything else (a real summary, even short) passes
+// through untouched.
+func isBareNoToolNeeded(text string) bool {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return false
+	}
+	return strings.EqualFold(t, "NO_TOOL_NEEDED")
+}
+
 func contentToString(c any) string {
 	switch v := c.(type) {
 	case string:
@@ -1832,6 +1846,25 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	body.ConversationID = firstNonEmpty(body.ConversationID, body.ConversationIDC)
 	body.SessionID = firstNonEmpty(body.SessionID, body.SessionIDC)
 	log.Printf("[req-trace] id=%s stage=body_parsed messages=%d tools=%d choice=%s raw_bytes=%d", requestID, len(body.Messages), len(body.Tools), normalizedToolChoiceMode(body.ToolChoice), len(raw))
+	// Closure/short-request body dump: requests that come in with almost no
+	// history (<=2 messages) and no tools are suspicious — they may be the
+	// tail of a long tool-loop session that the client sent WITHOUT its full
+	// context, which upstream then answers with an empty completion and the
+	// client hangs. Log the full body plus routing headers so we can see
+	// exactly what the client sent and why it produced an empty reply.
+	if len(body.Messages) <= 2 && len(body.Tools) == 0 {
+		hdrs := ""
+		if v := r.Header.Get(sessionHeaderName); v != "" {
+			hdrs += " x-m365-session-id=" + v
+		}
+		if v := r.Header.Get("X-M365-Account-Id"); v != "" {
+			hdrs += " x-m365-account-id=" + v
+		}
+		if v := r.URL.Query().Get("stream"); v != "" {
+			hdrs += " stream=" + v
+		}
+		log.Printf("[closure-dump] id=%s headers=%s conversation_id=%q session_id=%q user=%q messages=%s", requestID, hdrs, body.ConversationID, body.SessionID, body.User, mustJSON(body.Messages))
+	}
 	// Retry dedup: a byte-identical retry within the window (client retries
 	// after "no reply" / upstream empty completion) must reuse the pinned
 	// conversation+account instead of opening a fresh cloud conversation on
@@ -3210,6 +3243,18 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				return
 			}
 		}
+	}
+	if isBareNoToolNeeded(res.Text) {
+		// The upstream model sometimes answers a completed tool loop with
+		// exactly "NO_TOOL_NEEDED" and no summary text. As a router decision
+		// that is a legal stop, but handed back to the client as answer
+		// content it reads as "this turn produced nothing" and the client
+		// stalls. Normalize it to an empty reply: Hermes then injects its
+		// "You just executed tool calls but returned an empty response"
+		// retry turn, which forces the model to actually summarize the tool
+		// results — the task continues instead of stopping dead.
+		log.Printf("[answer-empty] id=%s bare NO_TOOL_NEEDED, returning empty to trigger client retry", requestID)
+		res.Text = ""
 	}
 	if isContentPolicyBlock(res.Text) {
 		log.Printf("[content-policy] M365 blocked the request, returning 503")

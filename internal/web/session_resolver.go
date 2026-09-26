@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -27,6 +28,12 @@ type sessionBinding struct {
 	IPFingerprint  string    `json:"ipFingerprint,omitempty"`
 	UserField      string    `json:"userField,omitempty"`
 	ContextFinger  string    `json:"contextFinger,omitempty"`
+	// ContentHash is the canonical full-history fingerprint (role + content +
+	// tool call name/args, IDs ignored, text CALL_TOOL normalized). Two
+	// bindings with the same ContentHash and tenant are the SAME logical
+	// conversation even when the upstream M365 handed out a new cloud
+	// ConversationID — Bind migrates instead of forking a duplicate session.
+	ContentHash string `json:"contentHash,omitempty"`
 	// ContextHistory 鎸佷箙鍖栦繚瀛樻渶杩戜竴娆″崗璁殑瀹屾暣娑堟伅锛屼緵閲嶅惎鍚庣户缁仛
 	// 鍐呭鍓嶇紑鍖归厤锛岄伩鍏嶈繘绋嬮噸鍚鑷存墍鏈変細璇濋敭鍏ㄩ儴澶辨晥銆?
 	ContextHistory []oaiMsg `json:"contextHistory,omitempty"`
@@ -482,7 +489,71 @@ func contextPrefixLen(hist, msgs []oaiMsg) int {
 	return len(hist)
 }
 
-// messagesEqual 判断两条消息在会话键意义上等价：role 与文本内容一致。
+// canonicalMessageHash hashes one message the same way messagesEqual compares
+// it: role + content, with tool calls normalized through toolCallsFromMessage
+// (structured tool_calls and text "CALL_TOOL: name({...})" produce the same
+// hash, tool IDs ignored, JSON args key-order-insensitive). Message-level,
+// so full-history hashes agree across representation changes.
+func canonicalMessageHash(m oaiMsg) string {
+	h := sha256.New()
+	io.WriteString(h, m.Role)
+	io.WriteString(h, "\x00")
+	calls := toolCallsFromMessage(m)
+	if len(calls) == 0 {
+		// 空语义归一:与 messagesEqual 保持一致 —— "(empty)"、NO_TOOL_NEEDED、
+		// 空白都算"无实质文本",否则同一轮重放哈希不同,同长度帧无法按
+		// ContentHash 迁移(b8efef2f / 4653cac6 现场)。
+		io.WriteString(h, normalizedEmptyishContent(m.Content))
+		io.WriteString(h, "\x00")
+		return hex.EncodeToString(h.Sum(nil))
+	}
+	for _, raw := range calls {
+		fn, _ := raw["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		args, _ := fn["arguments"].(string)
+		io.WriteString(h, "tool\x00")
+		io.WriteString(h, name)
+		io.WriteString(h, "\x00")
+		io.WriteString(h, normalizeJSONArgs(args))
+		io.WriteString(h, "\x00")
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// bindingContentHash is the canonical full-history fingerprint of a session's
+// messages: each message hashed through canonicalMessageHash, concatenated.
+// Two histories that messagesEqual would accept as equal — including text
+// CALL_TOOL vs structured tool_calls — hash identically, so Bind can detect
+// that a fresh upstream ConversationID belongs to an already-recorded logical
+// conversation and migrate instead of forking.
+func bindingContentHash(messages []oaiMsg) string {
+	h := sha256.New()
+	for _, m := range messages {
+		io.WriteString(h, canonicalMessageHash(m))
+		io.WriteString(h, "\n")
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// historyPrefixEqual reports whether `prefix` equals the first len(prefix)
+// messages of `history`, compared with messagesEqual semantics (so text
+// CALL_TOOL and structured tool_calls match, tool IDs ignored, args
+// key-order-insensitive). Used by Bind to detect that an existing binding's
+// history is a strict prefix of the incoming full-context replay, proving the
+// same logical thread continued rather than a fork.
+func historyPrefixEqual(history, prefix []oaiMsg) bool {
+	if len(prefix) == 0 || len(history) < len(prefix) {
+		return false
+	}
+	for i := range prefix {
+		if !messagesEqual(history[i], prefix[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// messageEqual 判断两条消息在会话键意义上等价:role 与文本内容一致。
 // 忽略 tool_calls 的 ID 细节（会话键只关心内容如何被模型消化）。
 // 工具调用存在两种等价形态：结构化 tool_calls（OpenAI 重放）与
 // "CALL_TOOL: name({...})" 纯文本（上游模型文本决策/客户端改写重放）。
@@ -506,11 +577,42 @@ func messagesEqual(a, b oaiMsg) bool {
 		}
 		return true
 	}
-	// 两边都无工具调用：严格按内容比较。
+	// 两边都无工具调用:严格按内容比较。
+	// 空语义归一:纯空 / "(empty)" / 独立 "NO_TOOL_NEEDED"(未经工具路由,
+	// 或上游用它做终止标记)都是"本轮无实质文本"。同一轮重放时客户端可能
+	// 一次写成 NO_TOOL_NEEDED、一次写成 empty 占位 —— 前缀继承必须把它们
+	// 视为同一内容,否则同会话帧又分叉(b8efef2f / 4653cac6 现场)。
+	if isEmptyishContent(a.Content) && isEmptyishContent(b.Content) {
+		return true
+	}
 	return contentToString(a.Content) == contentToString(b.Content)
 }
 
-// toolCallsFromMessage 提取语义上的工具调用列表：结构化 tool_calls 原样返回；
+// isEmptyishContent 判断一条消息的内容是否"无实质文本":空串、纯空白、
+// "(empty)" 占位、或独立 NO_TOOL_NEEDED 终止标记。这些形态在会话键语义上
+// 等价——它们都表示"该轮没有给用户可读的输出"。
+func isEmptyishContent(c any) bool {
+	t := strings.TrimSpace(contentToString(c))
+	if t == "" {
+		return true
+	}
+	if t == "(empty)" || t == "NO_TOOL_NEEDED" {
+		return true
+	}
+	return false
+}
+
+// normalizedEmptyishContent 返回参与哈希的规范化内容:空语义一律归一为
+// 固定占位符,保证与 isEmptyishContent 判定完全一致(同一轮无论重放成
+// 空串 / "(empty)" / NO_TOOL_NEEDED,哈希都相同)。
+func normalizedEmptyishContent(c any) string {
+	if isEmptyishContent(c) {
+		return "\x00empty\x00"
+	}
+	return contentToString(c)
+}
+
+// toolCallsFromMessage 提取语义上的工具调用列表:结构化 tool_calls 原样返回;
 // "CALL_TOOL: name({...})" 纯文本形态解析为等价工具调用。返回 nil 表示该消息
 // 不携带任何工具调用（纯文本/普通轮次）。
 func toolCallsFromMessage(m oaiMsg) []map[string]any {
@@ -593,6 +695,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 		history = append(history, oaiMsg{Role: "assistant", Content: assistantText})
 	}
 	explicitID := r.Header.Get("X-M365-Session-Id")
+	contentHash := bindingContentHash(history)
 
 	// Locate an existing binding to update in place, scoped to this tenant:
 	// prefer the tenant-namespaced explicit id, then any binding this tenant
@@ -615,6 +718,52 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 			}
 		}
 	}
+	// Content-key migration — two shapes of the same logical thread:
+	//
+	// 1) Exact-content rotation: the upstream M365 hands out a NEW cloud
+	//    ConversationID for an IDENTICAL history replay (same messages, new
+	//    cloud id). Bind adopts the existing binding by full canonical hash.
+	// 2) Prefix-inheritance: the client replays a full-context history that
+	//    GREW by a turn (9→11→13 messages; same logical thread, new cloud id).
+	//    An existing binding whose history is a strict PREFIX of the incoming
+	//    history proves the same thread continued — adopt it and migrate the
+	//    new cloud id forward instead of forking one binding per frame.
+	//
+	// Without both, sessions.json fragments one conversation into multiple
+	// bindings (observed: 5 bindings for one "修复tg不通" thread).
+	if targetKey == "" && len(history) > 0 {
+		bestKey, bestLen := "", 0
+		for k, sess := range sr.sessions {
+			if sess.Tenant != tenant {
+				continue
+			}
+			sh := sess.ContextHistory
+			if len(sh) == 0 {
+				continue
+			}
+			if len(sh) == len(history) {
+				// Exact-content rotation: same length, canonical hash equal.
+				if sess.ContentHash != "" && sess.ContentHash == contentHash {
+					bestKey, bestLen = k, len(sh)
+					break
+				}
+				continue
+			}
+			if len(sh) >= len(history) {
+				continue
+			}
+			// Strict prefix extension: incoming[:len(sh)] == sh.
+			if !historyPrefixEqual(history, sh) {
+				continue
+			}
+			if len(sh) > bestLen {
+				bestKey, bestLen = k, len(sh)
+			}
+		}
+		if bestKey != "" {
+			targetKey = bestKey
+		}
+	}
 	if targetKey != "" {
 		sess := sr.sessions[targetKey]
 		sess.ConversationID = conversationID
@@ -624,6 +773,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 		sess.IPFingerprint = clientIPFingerprint(r)
 		sess.ContextFinger = contextFingerprint(history)
 		sess.ContextHistory = history
+		sess.ContentHash = contentHash
 		sess.Tenant = tenant
 		if explicitID != "" {
 			sess.ExplicitID = explicitID
@@ -646,6 +796,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 		UserField:      body.User,
 		ContextFinger:  contextFingerprint(history),
 		ContextHistory: history,
+		ContentHash:    contentHash,
 		Tenant:         tenant,
 		ExplicitID:     explicitID,
 	}

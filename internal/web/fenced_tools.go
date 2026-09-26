@@ -6,7 +6,55 @@ import (
 	"strings"
 )
 
-var fencedToolCall = regexp.MustCompile("(?s)```([A-Za-z0-9_-]+)\\s*\\n(.*?)\\n```")
+var fencedToolCall = regexp.MustCompile("(?s)```([A-Za-z0-9_-]+)\\s*\n(.*?)\n```")
+
+// parseCallToolInvocations extracts every "CALL_TOOL: name({...})" text-form
+// tool call in the given text. Degraded clients / bare upstream decisions may
+// relay a tool call as plain content instead of a structured tool_calls row;
+// that text is the same logical intent and must be convertible. Arguments are
+// decoded as one JSON value so nested braces and escaped strings survive.
+func parseCallToolInvocations(text string) []map[string]any {
+	var out []map[string]any
+	lower := strings.ToLower(text)
+	scan := 0
+	for {
+		rel := strings.Index(lower[scan:], "call_tool:")
+		if rel < 0 {
+			return out
+		}
+		start := scan + rel + len("call_tool:")
+		seg := strings.TrimSpace(text[start:])
+		lp := strings.Index(seg, "(")
+		if lp <= 0 {
+			scan = start + 1
+			continue
+		}
+		name := strings.TrimSpace(seg[:lp])
+		if name == "" || !regexp.MustCompile(`^[A-Za-z0-9_-]+$`).MatchString(name) {
+			scan = start + 1
+			continue
+		}
+		body := strings.TrimSpace(seg[lp+1:])
+		dec := json.NewDecoder(strings.NewReader(body))
+		var args any
+		if err := dec.Decode(&args); err != nil {
+			scan = start + 1
+			continue
+		}
+		after := strings.TrimSpace(body[dec.InputOffset():])
+		if !strings.HasPrefix(after, ")") {
+			scan = start + 1
+			continue
+		}
+		// Keep the raw argument text verbatim (decoder already validated it);
+		// re-marshaling would HTML-escape & -> \u0026 and could reorder keys.
+		raw := body[:dec.InputOffset()]
+		out = append(out, map[string]any{
+			"function": map[string]any{"name": name, "arguments": raw},
+		})
+		scan = start
+	}
+}
 
 // declaredShell returns the shell-ish tool name the client actually
 // declared (bash/sh/shell/powershell/cmd), or "" if none. Forcing an
@@ -90,6 +138,20 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 				out = append(out, detectedToolCall{ID: callID(shell, string(cmdBytes), len(out)), Type: "function", Name: shell, Arguments: cmdBytes})
 				break
 			}
+		}
+	}
+	if len(out) == 0 {
+		for _, raw := range parseCallToolInvocations(text) {
+			fn, _ := raw["function"].(map[string]any)
+			name, _ := fn["name"].(string)
+			args, _ := fn["arguments"].(string)
+			if name == "" || !allowed[name] || !toolChoiceAllows(choice, name) {
+				continue
+			}
+			if strings.TrimSpace(args) == "" || !json.Valid([]byte(args)) {
+				args = "{}"
+			}
+			out = append(out, detectedToolCall{ID: callID(name, args, len(out)), Type: toolType(name, tools), Name: name, Arguments: json.RawMessage(args)})
 		}
 	}
 	return out
