@@ -66,6 +66,17 @@ func compactToolResult(s string, limit int) string {
 func scopedCallID(name, args string, index int, scope string) string {
 	return "call_" + uuid.NewString()
 }
+var retryTolerantTools = map[string]bool{
+	// Memory-review turns (Hermes's "Review the conversation above and
+	// consider saving to memory") legitimately retry the SAME memory call
+	// with identical arguments while probing old_text/entry matches. That
+	// loop is the client working through its own memory maintenance, not a
+	// stuck model spinning on a tool — counting it toward StuckLoop turns a
+	// harmless retry chain into a hard 409 that stalls the user's task.
+	"memory": true, "memories": true, "save_memory": true, "update_memory": true,
+	"memory_save": true, "memory_replace": true,
+}
+
 func buildAgentLedger(messages []oaiMsg) agentLedger {
 	calls := map[string]toolEvidence{}
 	order := []string{}
@@ -96,20 +107,22 @@ func buildAgentLedger(messages []oaiMsg) agentLedger {
 	for _, id := range order {
 		e := calls[id]
 		l.ToolRounds++
-		sig := e.Name + "\x00" + e.Arguments
-		seenCall[sig]++
-		if seenCall[sig] >= 2 {
-			l.RepeatedCall = true
-			l.RepetitionSignature = sig
-		}
-		if seenCall[sig] >= 3 {
-			l.StuckLoop = true
+		if !retryTolerantTools[e.Name] {
+			sig := e.Name + "\x00" + e.Arguments
+			seenCall[sig]++
+			if seenCall[sig] >= 2 {
+				l.RepeatedCall = true
+				l.RepetitionSignature = sig
+			}
+			if seenCall[sig] >= 3 {
+				l.StuckLoop = true
+			}
 		}
 		if e.Result == "" {
 			l.Pending = append(l.Pending, e)
 		} else {
 			l.Completed = append(l.Completed, e)
-			if e.Failed {
+			if e.Failed && !retryTolerantTools[e.Name] {
 				fs := e.Name + "\x00" + e.Arguments + "\x00" + normalizeFailure(e.Result)
 				seenFailure[fs]++
 				if seenFailure[fs] >= 2 {

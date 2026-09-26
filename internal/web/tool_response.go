@@ -71,7 +71,7 @@ func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, sen
 		base := func(delta map[string]any, finish any) map[string]any {
 			return map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}}
 		}
-		firstDelta := map[string]any{"role": "assistant", "content": nil}
+		firstDelta := map[string]any{"role": "assistant", "content": ""}
 		if reasoning := sanitizePublicReasoningText(res.Reasoning); reasoning != "" {
 			firstDelta["reasoning_content"] = reasoning
 		}

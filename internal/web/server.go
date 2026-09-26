@@ -1947,6 +1947,27 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		s.writePublicIdentityChatResponse(w, r, &body, prompt, answer, startedAt)
 		return
 	}
+	// Session-title side-calls from the client (Hermes's "You name chat
+	// sessions" sub-requests, 2 messages, 0 tools) previously burned 15-20s
+	// retrying/cooldown against the M365 upstream until a 502 — while a
+	// title is pure metadata that never needs a strong model. Short-circuit
+	// locally with a deterministic title; the real task keeps running.
+	if titleJSON, ok := titleShortcut(body.Messages); ok && responseFormat == nil && !body.Stream {
+		log.Printf("[title-shortcut] id=%s local title %s", requestID, titleJSON)
+		jsonOut(w, map[string]any{
+			"id":      "chatcmpl-" + uuid.NewString(),
+			"object":  "chat.completion",
+			"created": time.Now().Unix(),
+			"model":   firstNonEmpty(body.Model, "m365-copilot"),
+			"choices": []map[string]any{{
+				"index":         0,
+				"message":       map[string]any{"role": "assistant", "content": titleJSON},
+				"finish_reason": "stop",
+			}},
+			"usage": map[string]any{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+		})
+		return
+	}
 	// Execution-intent requests that declared NO tools must not be answered
 	// with fabricated container output: the upstream model tends to pretend
 	// it ran the probe in its own cloud container (/mnt/data, its own node
@@ -2766,7 +2787,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			// chunks carry content or reasoning deltas.
 			if firstDelta {
 				firstDelta = false
-				withRole := map[string]any{"role": "assistant", "content": nil}
+				// content must be a string (OpenAI spec), NEVER null: clients
+				// (Hermes's SSE parser) crash on "content":null and treat the
+				// reply as empty → "No reply" after the gateway already did all
+				// the work. reasoning_content comes in its own delta chunks.
+				withRole := map[string]any{"role": "assistant", "content": ""}
 				for k, v := range delta {
 					withRole[k] = v
 				}
@@ -2826,7 +2851,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					holdActiveB = false
 					return errSandboxEject
 				}
-				if len(heldB) >= holdLimitB || (len(heldB) >= 512 && strings.ContainsAny(heldB, "。.!?\n")) {
+				if len(heldB) >= holdLimitB || (len(heldB) >= 256 && strings.ContainsAny(heldB, "。.!?\n")) || len(heldB) >= 384 {
 					holdActiveB = false
 					return onDelta(heldB)
 				}
@@ -2921,6 +2946,17 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}
 		}
 		if err == nil {
+			if holdActiveB && heldB != "" {
+				// End-of-stream flush: content that never crossed the eject
+				// threshold (short, sentence-less replies) was accumulating in
+				// heldB. Without this, ≤384-char answers vanished with the
+				// stream — the client saw an empty 200 and retried 3x then
+				// reported "No reply" while the gateway had the full answer.
+				holdActiveB = false
+				if writeErr := onDelta(heldB); writeErr != nil {
+					return
+				}
+			}
 			if content := contentFilter.Flush(); content != "" {
 				if writeErr := writeChunk(map[string]any{"content": content}); writeErr != nil {
 					return
