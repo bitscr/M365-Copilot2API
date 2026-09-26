@@ -35,8 +35,8 @@
 | `M365_TRUSTED_PROXIES` | CF 前置**必配** | `cloudflare` 或逗号分隔 CIDR 列表;只信任这些来源的 `X-Forwarded-For` |
 | `M365_FINGERPRINT_MODE` | CF 前置**必配** | `ua`(推荐,CF 后稳定)/ `ip_ua`(默认)/ `off` |
 | `M365_TOOL_PLANNING_MODE` | 否 | `router`(默认,推荐)/ `native`(上游透传,不推荐) |
-| `M365_CONTEXT_WINDOW` | 否 | 上下文窗口。**建议 `60000`**:上游 M365 在设置默认值 128000 之前就已退化(空回复/"No reply") |
-| `M365_MAX_OUTPUT_TOKENS` | 否 | 最大输出 token(建议 `4096` 与上述窗口搭配) |
+| `M365_CONTEXT_WINDOW` | 否 | 上下文窗口。**建议 `120000`**(实测 69K+ tokens 零退化,529K 也返回过 200;旧建议 60000 已被压测推翻) |
+| `M365_MAX_OUTPUT_TOKENS` | 否 | 最大输出 token(建议 `8192` 与上述窗口搭配) |
 | `M365_AUTO_CLEANUP_*` | 否 | 云对话自动清理:闲置窗口与数量上限 |
 | `M365_OUTBOUND_PROXY` / `M365_PROXY_POOL` | 否 | 上游调用走代理(WARP/SOCKS/HTTP) |
 
