@@ -11,7 +11,7 @@ body{background:var(--bg);color:var(--text);font-family:"Inter","SF Pro Display"
 @keyframes springIn{from{opacity:0;transform:scale(0.9) translateY(8px)}to{opacity:1;transform:scale(1) translateY(0)}}
 
 /* Sidebar - Translucent material */
-.sidebar{width:var(--sidebar-w);background:var(--surface);-webkit-backdrop-filter:blur(30px) saturate(180%);backdrop-filter:blur(30px) saturate(180%);border-right:1px solid var(--line);padding:24px 14px 18px;flex-shrink:0;display:flex;flex-direction:column;transition:background .3s ease,border-color .3s ease;height:100vh;position:sticky;top:0;overflow-y:auto}
+.sidebar{width:var(--sidebar-w);background:var(--surface);-webkit-backdrop-filter:blur(30px) saturate(180%);backdrop-filter:blur(30px) saturate(180%);border-right:1px solid var(--line);padding:24px 14px 18px;flex-shrink:0;display:flex;flex-direction:column;transition:background .3s ease,border-color .3s ease;min-height:100vh;overflow-y:auto;align-self:stretch}
 .logo{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:700;letter-spacing:-0.02em;padding:0 10px 22px;color:var(--text)}
 .logo-mark{width:22px;height:22px;display:grid;grid-template-columns:repeat(2,1fr);gap:2px;padding:2px;flex-shrink:0;border-radius:5px;overflow:hidden}
 .logo-mark span{display:block;border-radius:1.5px}
@@ -628,28 +628,29 @@ if (response.output_text) {
       <!-- Settings -->
       <section id="page-settings" style="display:none">
         <h2 style="font-size:18px;font-weight:700;margin-bottom:16px">Settings</h2>
-        <div class="card"><div class="card-head"><span class="card-title">请求与模型</span></div><div class="card-body"><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px"><div class="form-group"><label class="form-label">Chat timeout (seconds, 5-3600)</label><input class="form-input" id="setTimeout" type="number" min="5" max="3600" placeholder="600"></div><div class="form-group"><label class="form-label">Image timeout (seconds, 5-3600)</label><input class="form-input" id="setImageTimeout" type="number" min="5" max="3600" placeholder="300"></div><div class="form-group"><label class="form-label">Context window (tokens)</label><input class="form-input" id="setContextWindow" type="number" min="1024" placeholder="512000"></div><div class="form-group"><label class="form-label">Max output tokens</label><input class="form-input" id="setMaxOutput" type="number" min="1" placeholder="65536"></div><div class="form-group"><label class="form-label">Max tool calls / turn (1-64)</label><input class="form-input" id="setMaxToolCalls" type="number" min="1" max="64" placeholder="64"></div><div class="form-group"><label class="form-label">Max tool rounds (1-512)</label><input class="form-input" id="setMaxToolRounds" type="number" min="1" max="512" placeholder="512"></div><div class="form-group"><label class="form-label">Max conversation messages</label><input class="form-input" id="setMaxConvMsgs" type="number" min="1" max="10000" placeholder="10000"></div></div></div></div>
-        <div class="card" style="margin-top:16px"><div class="card-head"><span class="card-title">账号与限流</span></div><div class="card-body"><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px"><div class="form-group"><label class="form-label">Account concurrency (1-64)</label><input class="form-input" id="setAcctConcurrency" type="number" min="1" max="64" placeholder="16"></div><div class="form-group"><label class="form-label">Rate limit cooldown (seconds, 5-3600)</label><input class="form-input" id="setCooldown" type="number" min="5" max="3600" placeholder="30"></div><div class="form-group"><label class="form-label">Transient throttle cooldown (seconds, 5-600)</label><input class="form-input" id="setTransientCooldown" type="number" min="5" max="600" placeholder="15"></div><div class="form-group"><label class="form-label">Scenario</label><select class="form-input" id="setScenario"><option value="OfficeWebIncludedCopilot">OfficeWebIncludedCopilot</option><option value="Bizchat">Bizchat</option><option value="CopilotConsumer">CopilotConsumer</option><option value="Chathub">Chathub</option></select></div><div class="form-group"><label class="form-label">License type</label><select class="form-input" id="setLicense"><option value="Starter">Starter</option><option value="Premium">Premium</option><option value="Free">Free</option><option value="BCAIS">BCAIS</option><option value="BCSWW">BCSWW</option><option value="BCWAF">BCWAF</option><option value="BCWBF">BCWBF</option></select></div><div class="form-group"><label class="form-label">Log level</label><select class="form-input" id="setLogLevel"><option value="silent">silent</option><option value="error">error</option><option value="warn">warn</option><option value="info">info</option><option value="debug">debug</option></select></div></div></div></div>
-        <div class="card" style="margin-top:16px"><div class="card-head"><span class="card-title">功能开关</span></div><div class="card-body"><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px" id="featureFlags"></div><p class="form-hint">MemoryV2 / DeepWork / ComputerUse / RealtimeVoice / SystemPromptOverride / ImageAPI / DesignerImageGen4o / CodeCanvas / SydneyReconnect</p></div></div>
-        <div class="card" style="margin-top:16px"><div class="card-head"><span class="card-title">模型映射</span><span style="font-size:11px;color:var(--muted)">公开模型名 → 上游 tone</span></div><div class="table-wrap"><table class="table"><thead><tr><th>Public model</th><th>Upstream tone</th><th>Display name</th><th>Reasoning</th><th style="text-align:right">Actions</th></tr></thead><tbody id="modelMapRows"></tbody></table></div><div class="card-body" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end"><div class="form-group" style="margin:0"><label class="form-label">Public model</label><input class="form-input" id="newModelId" placeholder="gpt-5.7-chat" style="width:160px"></div><div class="form-group" style="margin:0"><label class="form-label">Upstream tone</label><select class="form-input" id="newModelTone" style="width:200px"></select></div><div class="form-group" style="margin:0"><label class="form-label">Display name</label><input class="form-input" id="newModelDisplay" placeholder="GPT-5.7" style="width:140px"></div><div class="form-group" style="margin:0"><label class="form-label">Reasoning</label><select class="form-input" id="newModelEffort" style="width:110px"><option value="low">low</option><option value="minimal">minimal</option><option value="medium" selected>medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="none">none</option></select></div><button class="btn-sm btn primary" onclick="addModelMapping()">Add</button></div></div>
-        <div class="card" style="margin-top:16px"><div class="card-head"><span class="card-title">系统</span></div><div class="card-body"><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;align-items:end"><div class="form-group" style="margin:0" id="setAutoStartWrap"><label style="display:flex;align-items:center;gap:8px;font-size:13px"><input id="setAutoStart" type="checkbox"> 开机自启动（当前用户，免管理员）</label><p class="form-hint">写入 HKCU Run 注册表项，指向当前可执行文件。</p></div><div class="form-group" style="margin:0"><label class="form-label">日志位置</label><input class="form-input" id="setLogPath" readonly placeholder="stdout / stderr"><p class="form-hint">M365_DEBUG_LOG 环境变量设置 debug 日志文件；运行日志输出到进程 stdout/stderr。</p></div></div></div></div>
-        <div class="card" style="margin-top:16px"><div class="card-body"><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px"><div class="form-group"><label class="form-label">Listen address (需重启)</label><input class="form-input" id="setListen" placeholder="127.0.0.1:4141"></div><div class="form-group"><label class="form-label" for="languageSelect">Language</label><select class="form-input" id="languageSelect"><option value="en">English</option><option value="zh-CN">简体中文</option><option value="zh-TW">繁體中文</option><option value="ja">日本語</option><option value="ko">한국어</option><option value="es">Español</option><option value="fr">Français</option><option value="de">Deutsch</option><option value="pt-BR">Português (Brasil)</option><option value="ru">Русский</option><option value="ar">العربية</option></select></div></div><div style="margin-top:16px;display:flex;gap:8px"><button class="btn primary" onclick="saveSettings()">Save settings</button><button class="btn" onclick="loadSettings()">Reload</button></div></div></div>
+        <div class="card"><div class="card-head"><span class="card-title">Request &amp; model</span></div><div class="card-body"><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px"><div class="form-group"><label class="form-label">Chat timeout (seconds, 5-3600)</label><input class="form-input" id="setTimeout" type="number" min="5" max="3600" placeholder="600"></div><div class="form-group"><label class="form-label">Image timeout (seconds, 5-3600)</label><input class="form-input" id="setImageTimeout" type="number" min="5" max="3600" placeholder="300"></div><div class="form-group"><label class="form-label">Context window (tokens)</label><input class="form-input" id="setContextWindow" type="number" min="1024" placeholder="512000"></div><div class="form-group"><label class="form-label">Max output tokens</label><input class="form-input" id="setMaxOutput" type="number" min="1" placeholder="65536"></div><div class="form-group"><label class="form-label">Max tool calls / turn (1-64)</label><input class="form-input" id="setMaxToolCalls" type="number" min="1" max="64" placeholder="64"></div><div class="form-group"><label class="form-label">Max tool rounds (1-512)</label><input class="form-input" id="setMaxToolRounds" type="number" min="1" max="512" placeholder="512"></div><div class="form-group"><label class="form-label">Max conversation messages</label><input class="form-input" id="setMaxConvMsgs" type="number" min="1" max="10000" placeholder="10000"></div></div></div></div>
+        <div class="card" style="margin-top:16px"><div class="card-head"><span class="card-title">Accounts &amp; rate limits</span></div><div class="card-body"><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px"><div class="form-group"><label class="form-label">Account concurrency (1-64)</label><input class="form-input" id="setAcctConcurrency" type="number" min="1" max="64" placeholder="16"></div><div class="form-group"><label class="form-label">Rate limit cooldown (seconds, 5-3600)</label><input class="form-input" id="setCooldown" type="number" min="5" max="3600" placeholder="30"></div><div class="form-group"><label class="form-label">Transient throttle cooldown (seconds, 5-600)</label><input class="form-input" id="setTransientCooldown" type="number" min="5" max="600" placeholder="15"></div><div class="form-group"><label class="form-label">Scenario</label><select class="form-input" id="setScenario"><option value="OfficeWebIncludedCopilot">OfficeWebIncludedCopilot</option><option value="Bizchat">Bizchat</option><option value="CopilotConsumer">CopilotConsumer</option><option value="Chathub">Chathub</option></select></div><div class="form-group"><label class="form-label">License type</label><select class="form-input" id="setLicense"><option value="Starter">Starter</option><option value="Premium">Premium</option><option value="Free">Free</option><option value="BCAIS">BCAIS</option><option value="BCSWW">BCSWW</option><option value="BCWAF">BCWAF</option><option value="BCWBF">BCWBF</option></select></div><div class="form-group"><label class="form-label">Log level</label><select class="form-input" id="setLogLevel"><option value="silent">silent</option><option value="error">error</option><option value="warn">warn</option><option value="info">info</option><option value="debug">debug</option></select></div></div></div></div>
+        <div class="card" style="margin-top:16px"><div class="card-head"><span class="card-title">Feature flags</span></div><div class="card-body"><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px" id="featureFlags"></div><p class="form-hint">MemoryV2 / DeepWork / ComputerUse / RealtimeVoice / SystemPromptOverride / ImageAPI / DesignerImageGen4o / CodeCanvas / SydneyReconnect</p></div></div>
+        <div class="card" style="margin-top:16px"><div class="card-head"><span class="card-title">Model mapping</span><span style="font-size:11px;color:var(--muted)">Public model → upstream tone</span></div><div class="table-wrap"><table class="table"><thead><tr><th>Public model</th><th>Upstream tone</th><th>Display name</th><th>Reasoning</th><th style="text-align:right">Actions</th></tr></thead><tbody id="modelMapRows"></tbody></table></div><div class="card-body" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end"><div class="form-group" style="margin:0"><label class="form-label">Public model</label><input class="form-input" id="newModelId" placeholder="gpt-5.7-chat" style="width:160px"></div><div class="form-group" style="margin:0"><label class="form-label">Upstream tone</label><select class="form-input" id="newModelTone" style="width:200px"></select></div><div class="form-group" style="margin:0"><label class="form-label">Display name</label><input class="form-input" id="newModelDisplay" placeholder="GPT-5.7" style="width:140px"></div><div class="form-group" style="margin:0"><label class="form-label">Reasoning</label><select class="form-input" id="newModelEffort" style="width:110px"><option value="low">low</option><option value="minimal">minimal</option><option value="medium" selected>medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="none">none</option></select></div><button class="btn-sm btn primary" onclick="addModelMapping()">Add</button></div></div>
+        <div class="card" style="margin-top:16px"><div class="card-head"><span class="card-title">System</span></div><div class="card-body"><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;align-items:end"><div class="form-group" style="margin:0" id="setAutoStartWrap"><label style="display:flex;align-items:center;gap:8px;font-size:13px"><input id="setAutoStart" type="checkbox"> Start on login (current user)</label><p class="form-hint">Writes an HKCU Run registry entry pointing to the current executable.</p></div><div class="form-group" style="margin:0"><label class="form-label">Log file path</label><input class="form-input" id="setLogPath" readonly placeholder="stdout / stderr"><p class="form-hint">M365_DEBUG_LOG sets the debug log file; runtime logs go to the process stdout/stderr.</p></div></div></div></div>
+        <div class="card" style="margin-top:16px"><div class="card-body"><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px"><div class="form-group"><label class="form-label">Listen address</label><input class="form-input" id="setListen" placeholder="127.0.0.1:4141"></div><div class="form-group"><label class="form-label" for="languageSelect">Language</label><select class="form-input" id="languageSelect"><option value="en">English</option><option value="zh-CN">简体中文</option></select></div></div><div style="margin-top:16px;display:flex;gap:8px"><button class="btn primary" onclick="saveSettings()">Save settings</button><button class="btn" onclick="loadSettings()">Reload</button></div></div></div>
 <div class="card" style="margin-top:16px"><div class="card-body">
-<h3 style="font-size:15px;font-weight:600;margin:0 0 14px">修改管理员密码 / Change admin password</h3>
-<div class="form-group"><label class="form-label">当前密码 / Current password</label><input class="form-input" id="cpCurrent" type="password" autocomplete="current-password"></div>
-<div class="form-group"><label class="form-label">新密码 / New password</label><input class="form-input" id="cpNew" type="password" autocomplete="new-password" minlength="6"><p class="form-hint">至少 6 个字符。修改后所有已登录会话失效，需用新密码重新登录。</p></div>
-<div class="form-group"><label class="form-label">确认新密码 / Confirm new password</label><input class="form-input" id="cpConfirm" type="password" autocomplete="new-password" minlength="6"></div>
-<div style="margin-top:16px"><button class="btn primary" onclick="changeAdminPassword()">修改密码 / Change password</button></div>
+<h3 style="font-size:15px;font-weight:600;margin:0 0 14px">Change admin password</h3>
+<div class="form-group"><label class="form-label">Current password</label><input class="form-input" id="cpCurrent" type="password" autocomplete="current-password"></div>
+<div class="form-group"><label class="form-label">New password</label><input class="form-input" id="cpNew" type="password" autocomplete="new-password" minlength="6"><p class="form-hint">At least 6 characters. After changing, all logged-in sessions are invalidated; log in again with the new password.</p></div>
+<div class="form-group"><label class="form-label">Confirm new password</label><input class="form-input" id="cpConfirm" type="password" autocomplete="new-password" minlength="6"></div>
+<div style="margin-top:16px"><button class="btn primary" onclick="changeAdminPassword()">Change password</button></div>
 </div></div>
 <div class="card" style="margin-top:16px"><div class="card-body">
-<h3 style="font-size:15px;font-weight:600;margin:0 0 14px">备份 / Backup</h3>
-<p class="form-hint" style="margin-top:0">导出全部数据（账号、API 密钥、会话、对话、管理密码）为 zip 压缩包；导入将覆盖当前数据，导入前服务端会自动保留一份 .pre-import 现场备份，完成后服务自动重启生效。</p>
+<h3 style="font-size:15px;font-weight:600;margin:0 0 14px">Backup</h3>
+<p class="form-hint" style="margin-top:0">Exports all data (accounts, API keys, sessions, conversations, admin password) as a zip; import overwrites current data, keeps a .pre-import snapshot, and restarts automatically afterwards.</p>
 <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px">
-<button class="btn primary" onclick="exportBackup()">导出备份 / Export</button>
-<label class="btn" style="cursor:pointer">导入备份 / Import<input type="file" id="importBackupFile" accept=".zip" style="display:none" onchange="importBackup(this.files[0])"></label>
+<button class="btn primary" onclick="exportBackup()">Export</button>
+<label class="btn" style="cursor:pointer">Import<input type="file" id="importBackupFile" accept=".zip" style="display:none" onchange="importBackup(this.files[0])"></label>
 </div>
 <div id="backupResult" style="margin-top:12px;display:none"></div>
 </div></div>
+      <div class="modal-overlay" id="restartModal"><div class="modal"><h3 id="restartModalTitle" style="font-size:15px;font-weight:600"></h3><p id="restartModalBody" style="font-size:13px;color:var(--muted);margin-top:10px;line-height:1.6"></p><div style="margin-top:18px;display:flex;justify-content:flex-end"><button class="btn primary" onclick="document.getElementById('restartModal').classList.remove('open')">OK</button></div></div></div>
       </section>
     </div>
   </main>
@@ -729,7 +730,7 @@ const $=id=>document.getElementById(id);
 const pages={dashboard:'Dashboard',usage:'Usage',accounts:'Accounts',apikeys:'API Keys',conversations:'Conversations',proxies:'Proxy Pool',modeltest:'Model Test',settings:'Settings'};
 const localeStorageKey='m365_locale';
 const localeSelectionKey='m365_locale_selected';
-const SUPPORTED_LOCALES=['en','zh-CN','zh-TW','ja','ko','es','fr','de','pt-BR','ru','ar'];
+const SUPPORTED_LOCALES=['en','zh-CN'];
 const localeText={
   'Administrator Login': {'zh-CN':'管理员登录','zh-TW':'管理員登入','ja':'管理者ログイン','ko':'관리자 로그인','es':'Inicio de sesión de administrador','fr':'Connexion administrateur','de':'Administrator-Anmeldung','pt-BR':'Login de administrador','ru':'Вход администратора','ar':'تسجيل دخول المسؤول'},
   'Password': {'zh-CN':'密码','zh-TW':'密碼','ja':'パスワード','ko':'비밀번호','es':'Contraseña','fr':'Mot de passe','de':'Passwort','pt-BR':'Senha','ru':'Пароль','ar':'كلمة المرور'},
@@ -916,7 +917,58 @@ const localeText={
   'Mapping already exists': {'zh-CN':'映射已存在','zh-TW':'映射已存在','ja':'マッピングは既に存在します','ko':'매핑이 이미 존재합니다','es':'El mapeo ya existe','fr':'Le mappage existe déjà','de':'Zuordnung existiert bereits','pt-BR':'O mapeamento já existe','ru':'Сопоставление уже существует','ar':'التعيين موجود بالفعل'},
   'Bind proxy for this account…': {'zh-CN':'为此账号绑定代理…','zh-TW':'為此帳號綁定代理…','ja':'このアカウントにプロキシをバインド…','ko':'이 계정에 프록시 바인딩…','es':'Vincular proxy a esta cuenta…','fr':'Lier un proxy à ce compte…','de':'Proxy für dieses Konto binden…','pt-BR':'Vincular proxy a esta conta…','ru':'Привязать прокси к этому аккаунту…','ar':'ربط وكيل بهذا الحساب…'},
   'Proxy bound': {'zh-CN':'已绑定代理','zh-TW':'已綁定代理','ja':'プロキシをバインドしました','ko':'프록시 바인딩됨','es':'Proxy vinculado','fr':'Proxy lié','de':'Proxy gebunden','pt-BR':'Proxy vinculado','ru':'Прокси привязан','ar':'تم ربط الوكيل'},
-  'Proxy unbound': {'zh-CN':'已解绑代理','zh-TW':'已解綁代理','ja':'プロキシを解除しました','ko':'프록시 해제됨','es':'Proxy desvinculado','fr':'Proxy délié','de':'Proxy getrennt','pt-BR':'Proxy desvinculado','ru':'Прокси отвязан','ar':'تم فصل الوكيل'}
+  'Proxy unbound': {'zh-CN':'已解绑代理','zh-TW':'已解綁代理','ja':'プロキシを解除しました','ko':'프록시 해제됨','es':'Proxy desvinculado','fr':'Proxy délié','de':'Proxy getrennt','pt-BR':'Proxy desvinculado','ru':'Прокси отвязан','ar':'تم فصل الوكيل'},
+  'Request & model': {'zh-CN':'请求与模型'},
+  'Accounts & rate limits': {'zh-CN':'账号与限流'},
+  'Feature flags': {'zh-CN':'功能开关'},
+  'Model mapping': {'zh-CN':'模型映射'},
+  'Public model → upstream tone': {'zh-CN':'公开模型名 → 上游 tone'},
+  'Public model': {'zh-CN':'公开模型'},
+  'Upstream tone': {'zh-CN':'上游 tone'},
+  'Display name': {'zh-CN':'显示名称'},
+  'Reasoning': {'zh-CN':'思考度'},
+  'Add': {'zh-CN':'添加'},
+  'Delete': {'zh-CN':'删除'},
+  'No custom mappings (using built-in catalog)': {'zh-CN':'暂无自定义映射（使用内置目录）'},
+  'Chat timeout (seconds, 5-3600)': {'zh-CN':'聊天超时（秒，5-3600）'},
+  'Image timeout (seconds, 5-3600)': {'zh-CN':'图片超时（秒，5-3600）'},
+  'Context window (tokens)': {'zh-CN':'上下文窗口（tokens）'},
+  'Max output tokens': {'zh-CN':'最大输出 token'},
+  'Max tool calls / turn (1-64)': {'zh-CN':'每轮最大工具调用数（1-64）'},
+  'Max tool rounds (1-512)': {'zh-CN':'最大工具轮次（1-512）'},
+  'Max conversation messages': {'zh-CN':'最大对话消息数'},
+  'Account concurrency (1-64)': {'zh-CN':'账号并发数（1-64）'},
+  'Rate limit cooldown (seconds, 5-3600)': {'zh-CN':'限流冷却（秒，5-3600）'},
+  'Transient throttle cooldown (seconds, 5-600)': {'zh-CN':'瞬时节流冷却（秒，5-600）'},
+  'Scenario': {'zh-CN':'场景'},
+  'License type': {'zh-CN':'许可证类型'},
+  'Log level': {'zh-CN':'日志等级'},
+  'Listen address': {'zh-CN':'监听地址'},
+  'Save settings': {'zh-CN':'保存设置'},
+  'Reload': {'zh-CN':'重新加载'},
+  'Start on login (current user)': {'zh-CN':'开机自启动（当前用户，免管理员）'},
+  'Writes an HKCU Run registry entry pointing to the current executable.': {'zh-CN':'写入 HKCU Run 注册表项，指向当前可执行文件。'},
+  'Log file path': {'zh-CN':'日志位置'},
+  'M365_DEBUG_LOG sets the debug log file; runtime logs go to the process stdout/stderr.': {'zh-CN':'M365_DEBUG_LOG 环境变量设置 debug 日志文件；运行日志输出到进程 stdout/stderr。'},
+  'Change admin password': {'zh-CN':'修改管理员密码'},
+  'Current password': {'zh-CN':'当前密码'},
+  'New password': {'zh-CN':'新密码'},
+  'At least 6 characters. After changing, all logged-in sessions are invalidated; log in again with the new password.': {'zh-CN':'至少 6 个字符。修改后所有已登录会话失效，需用新密码重新登录。'},
+  'Confirm new password': {'zh-CN':'确认新密码'},
+  'Change password': {'zh-CN':'修改密码'},
+  'Backup': {'zh-CN':'备份'},
+  'Exports all data (accounts, API keys, sessions, conversations, admin password) as a zip; import overwrites current data, keeps a .pre-import snapshot, and restarts automatically afterwards.': {'zh-CN':'导出全部数据（账号、API 密钥、会话、对话、管理密码）为 zip 压缩包；导入将覆盖当前数据，导入前服务端会自动保留一份 .pre-import 现场备份，完成后服务自动重启生效。'},
+  'Export': {'zh-CN':'导出备份'},
+  'Import': {'zh-CN':'导入备份'},
+  'Select all': {'zh-CN':'全选'},
+  'Enable sched': {'zh-CN':'开启调度'},
+  'Disable sched': {'zh-CN':'关闭调度'},
+  'Search on': {'zh-CN':'开启搜索'},
+  'Search off': {'zh-CN':'关闭搜索'},
+  'Apply prompt': {'zh-CN':'应用提示词'},
+  'Clear prompt': {'zh-CN':'清除提示词'},
+  'OK': {'zh-CN':'确定'},
+  'System prompt for selected…': {'zh-CN':'选中账号的系统提示词…'}
 };
 function preferredLocale(){
   try{
@@ -928,6 +980,7 @@ function preferredLocale(){
 }
 let currentLocale=preferredLocale();
 let localeObserver=null;
+let _savedListenAddress='';
 function localeReverse(){const out={};Object.entries(localeText).forEach(([en,v])=>{if(v&&typeof v==='object'){Object.values(v).forEach(t=>{if(t&&!out[t])out[t]=en;});}else if(v&&!out[v]){out[v]=en;}});return out;}
 const localeTextReverse=localeReverse();
 function translateDynamic(value,locale){
@@ -942,6 +995,7 @@ function translateDynamic(value,locale){
     m=value.match(/^Input (\d+) · Output (\d+)$/);if(m)return '输入 '+m[1]+' · 输出 '+m[2];
     m=value.match(/^in(\d+)\/out(\d+)\/cache(\d+)$/);if(m)return '入'+m[1]+'/出'+m[2]+'/缓'+m[3];
     m=value.match(/^Page (\d+) \/ (\d+) · (\d+) total$/);if(m)return '第 '+m[1]+' / '+m[2]+' 页 · 共 '+m[3]+' 条';
+    m=value.match(/^(\d+) selected$/);if(m)return '已选 '+m[1]+' 个';
     m=value.match(/^Added (\d+) proxies$/);if(m)return '已添加 '+m[1]+' 个代理';
     m=value.match(/^Connection healthy: (.+)$/);if(m)return '连通正常：'+m[1];
     m=value.match(/^Finished: (\d+) succeeded, (\d+) failed, (\d+) rounds total\.$/);if(m)return '完成：成功 '+m[1]+' 个，失败 '+m[2]+' 个，共 '+m[3]+' 轮。';
@@ -957,6 +1011,7 @@ function translateDynamic(value,locale){
     m=value.match(/^输入 (\d+) · 输出 (\d+)$/);if(m)return 'Input '+m[1]+' · Output '+m[2];
     m=value.match(/^入(\d+)\/出(\d+)\/缓(\d+)$/);if(m)return 'in'+m[1]+'/out'+m[2]+'/cache'+m[3];
     m=value.match(/^第 (\d+) \/ (\d+) 页 · 共 (\d+) 条$/);if(m)return 'Page '+m[1]+' / '+m[2]+' · '+m[3]+' total';
+    m=value.match(/^已选 (\d+) 个$/);if(m)return m[1]+' selected';
     m=value.match(/^已添加 (\d+) 个代理$/);if(m)return 'Added '+m[1]+' proxies';
     m=value.match(/^连通正常：(.+)$/);if(m)return 'Connection healthy: '+m[1];
     m=value.match(/^完成：成功 (\d+) 个，失败 (\d+) 个，共 (\d+) 轮。$/);if(m)return 'Finished: '+m[1]+' succeeded, '+m[2]+' failed, '+m[3]+' rounds total.';
@@ -1672,6 +1727,7 @@ async function loadSettings(){
     const d=await api('/api/admin/settings');
     const v=d.settings||{};
     $('setListen').value=v.listenAddress||'';
+    _savedListenAddress=$('setListen').value.trim();
     $('setTimeout').value=v.chatTimeoutSeconds??'';
     $('setImageTimeout').value=v.imageTimeoutSeconds??'';
     $('setContextWindow').value=v.contextWindow??'';
@@ -1685,7 +1741,7 @@ async function loadSettings(){
     $('setScenario').value=v.scenario||'OfficeWebIncludedCopilot';
     $('setLicense').value=v.licenseType||'Starter';
     $('setLogLevel').value=v.logLevel||'info';
-    $('setLogPath').value=v.debugLogPath||'stdout / stderr（M365_DEBUG_LOG 可配置）';
+    $('setLogPath').value=v.debugLogPath||'stdout / stderr';
     const asWrap=$('setAutoStartWrap');
     if(d.autoStartSupported===false){if(asWrap)asWrap.style.display='none';}
     else{$('setAutoStart').checked=!!d.autoStart;}
@@ -1737,6 +1793,14 @@ async function saveSettings(){
     if(resp&&resp.autoStartError)showNotice('自启动设置失败: '+resp.autoStartError,'error');
     else if(resp&&resp.autoStartApplied!==undefined)showNotice(resp.autoStartApplied?'已开启开机自启动':'已关闭开机自启动','success');
     showNotice('设置已保存','success');
+    const listenChanged=body.listenAddress&&body.listenAddress!==_savedListenAddress;
+    if(listenChanged){
+      const isZh=currentLocale==='zh-CN';
+      $('restartModalTitle').textContent=isZh?'设置已保存，正在自动重启':'Settings saved, restarting';
+      $('restartModalBody').textContent=isZh?('监听地址已变更为 '+body.listenAddress+'。服务正在自动重启，重启完成后，请通过新地址访问控制台。'):('Listen address changed to '+body.listenAddress+'. The service is restarting automatically; afterwards open the console at the new address.');
+      $('restartModal').classList.add('open');
+      fetch('/api/admin/restart',{method:'POST'}).catch(()=>{});
+    }
   }catch(e){showNotice(e.message,'error');}
 }
 

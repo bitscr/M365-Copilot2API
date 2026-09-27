@@ -364,3 +364,9 @@ func ApplyStartupSettingsEnv() {
 		}
 	}
 }
+
+// CurrentListenAddress returns the address the gateway should bind at
+// startup. Persisted settings.json wins (console-managed), falling back to
+// the M365_LISTEN env default folded into defaultRuntimeSettings. Empty only
+// when neither is configured — callers fall back to the hard default.
+func CurrentListenAddress() string { return currentSettings().ListenAddress }

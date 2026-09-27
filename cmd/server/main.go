@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -34,11 +35,12 @@ func main() {
 	s.RefreshExpiredTokens()
 	// Default to all interfaces: the common deployment is behind a reverse
 	// proxy, container port mapping, or a tunnel, where binding loopback makes
-	// the service unreachable. Set M365_LISTEN to 127.0.0.1:4141 to restrict it
-	// to the local host.
-	listen := "0.0.0.0:4141"
-	if v := os.Getenv("M365_LISTEN"); v != "" {
-		listen = v
+	// the service unreachable. The console-managed listenAddress in
+	// settings.json wins (falls back to M365_LISTEN env, then 0.0.0.0:4141).
+	// Without this, changing the port in the console would never rebind.
+	listen := web.CurrentListenAddress()
+	if strings.TrimSpace(listen) == "" {
+		listen = "0.0.0.0:4141"
 	}
 	log.Printf("m365-copilot2api listening on http://%s", listen)
 	server := &http.Server{
