@@ -418,6 +418,16 @@ if (response.output_text) {
           <div class="stat"><span class="stat-label">Hit rate</span><span class="stat-value" id="stat-rate">0</span><span class="stat-unit">%</span></div>
           <div class="stat"><span class="stat-label">Tokens saved</span><span class="stat-value" id="stat-saved">0</span><span class="stat-unit" style="font-size:12px">saved</span></div>
         </div>
+
+        <div class="card" id="quotaDashboard" style="display:none">
+          <div class="card-head"><span class="card-title">实时额度</span><span id="quotaSub" style="font-size:11px;color:var(--muted)"></span><button class="btn btn-sm" style="margin-left:auto" onclick="loadAccounts()">刷新</button></div>
+          <div class="card-body">
+            <div id="quotaTotals"></div>
+            <div id="quotaCooldowns" style="margin-top:16px"></div>
+            <div id="quotaAdvice" style="margin-top:12px;font-size:11px;color:var(--muted);padding:8px 10px;background:var(--bg);border-radius:8px;border:1px solid var(--line)"></div>
+          </div>
+        </div>
+
         <div class="card">
           <div class="card-head"><span class="card-title">Quick actions</span></div>
           <div class="card-body">
@@ -562,6 +572,7 @@ if (response.output_text) {
         <div class="page-head">
           <div><h2 class="page-title">Conversation management</h2><p class="page-sub">View and clean up M365 conversations</p></div>
           <div style="display:flex;gap:8px">
+            <button class="btn" onclick="loadConversations()" title="刷新列表"><i data-lucide="refresh-cw" style="width:14px;height:14px"></i> 刷新</button>
             <button class="btn danger" onclick="cleanupAll()">Clean up all</button>
           </div>
         </div>
@@ -623,6 +634,22 @@ if (response.output_text) {
         <div class="card" style="margin-top:16px"><div class="card-head"><span class="card-title">模型映射</span><span style="font-size:11px;color:var(--muted)">公开模型名 → 上游 tone</span></div><div class="table-wrap"><table class="table"><thead><tr><th>Public model</th><th>Upstream tone</th><th>Display name</th><th>Reasoning</th><th style="text-align:right">Actions</th></tr></thead><tbody id="modelMapRows"></tbody></table></div><div class="card-body" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end"><div class="form-group" style="margin:0"><label class="form-label">Public model</label><input class="form-input" id="newModelId" placeholder="gpt-5.7-chat" style="width:160px"></div><div class="form-group" style="margin:0"><label class="form-label">Upstream tone</label><select class="form-input" id="newModelTone" style="width:200px"></select></div><div class="form-group" style="margin:0"><label class="form-label">Display name</label><input class="form-input" id="newModelDisplay" placeholder="GPT-5.7" style="width:140px"></div><div class="form-group" style="margin:0"><label class="form-label">Reasoning</label><select class="form-input" id="newModelEffort" style="width:110px"><option value="low">low</option><option value="minimal">minimal</option><option value="medium" selected>medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="none">none</option></select></div><button class="btn-sm btn primary" onclick="addModelMapping()">Add</button></div></div>
         <div class="card" style="margin-top:16px"><div class="card-head"><span class="card-title">系统</span></div><div class="card-body"><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;align-items:end"><div class="form-group" style="margin:0" id="setAutoStartWrap"><label style="display:flex;align-items:center;gap:8px;font-size:13px"><input id="setAutoStart" type="checkbox"> 开机自启动（当前用户，免管理员）</label><p class="form-hint">写入 HKCU Run 注册表项，指向当前可执行文件。</p></div><div class="form-group" style="margin:0"><label class="form-label">日志位置</label><input class="form-input" id="setLogPath" readonly placeholder="stdout / stderr"><p class="form-hint">M365_DEBUG_LOG 环境变量设置 debug 日志文件；运行日志输出到进程 stdout/stderr。</p></div></div></div></div>
         <div class="card" style="margin-top:16px"><div class="card-body"><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px"><div class="form-group"><label class="form-label">Listen address (需重启)</label><input class="form-input" id="setListen" placeholder="127.0.0.1:4141"></div><div class="form-group"><label class="form-label" for="languageSelect">Language</label><select class="form-input" id="languageSelect"><option value="en">English</option><option value="zh-CN">简体中文</option><option value="zh-TW">繁體中文</option><option value="ja">日本語</option><option value="ko">한국어</option><option value="es">Español</option><option value="fr">Français</option><option value="de">Deutsch</option><option value="pt-BR">Português (Brasil)</option><option value="ru">Русский</option><option value="ar">العربية</option></select></div></div><div style="margin-top:16px;display:flex;gap:8px"><button class="btn primary" onclick="saveSettings()">Save settings</button><button class="btn" onclick="loadSettings()">Reload</button></div></div></div>
+<div class="card" style="margin-top:16px"><div class="card-body">
+<h3 style="font-size:15px;font-weight:600;margin:0 0 14px">修改管理员密码 / Change admin password</h3>
+<div class="form-group"><label class="form-label">当前密码 / Current password</label><input class="form-input" id="cpCurrent" type="password" autocomplete="current-password"></div>
+<div class="form-group"><label class="form-label">新密码 / New password</label><input class="form-input" id="cpNew" type="password" autocomplete="new-password" minlength="6"><p class="form-hint">至少 6 个字符。修改后所有已登录会话失效，需用新密码重新登录。</p></div>
+<div class="form-group"><label class="form-label">确认新密码 / Confirm new password</label><input class="form-input" id="cpConfirm" type="password" autocomplete="new-password" minlength="6"></div>
+<div style="margin-top:16px"><button class="btn primary" onclick="changeAdminPassword()">修改密码 / Change password</button></div>
+</div></div>
+<div class="card" style="margin-top:16px"><div class="card-body">
+<h3 style="font-size:15px;font-weight:600;margin:0 0 14px">备份 / Backup</h3>
+<p class="form-hint" style="margin-top:0">导出全部数据（账号、API 密钥、会话、对话、管理密码）为 zip 压缩包；导入将覆盖当前数据，导入前服务端会自动保留一份 .pre-import 现场备份，完成后服务自动重启生效。</p>
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px">
+<button class="btn primary" onclick="exportBackup()">导出备份 / Export</button>
+<label class="btn" style="cursor:pointer">导入备份 / Import<input type="file" id="importBackupFile" accept=".zip" style="display:none" onchange="importBackup(this.files[0])"></label>
+</div>
+<div id="backupResult" style="margin-top:12px;display:none"></div>
+</div></div>
       </section>
     </div>
   </main>
@@ -649,6 +676,15 @@ if (response.output_text) {
     </div>
   </div>
 </div>
+
+<!-- View Key Modal -->
+<div class="modal-overlay" id="viewKeyModal">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h3>View API key</h3>
+        <p class="subtitle" id="viewKeyName"></p>
+      </div>
 
 <!-- Edit Key Modal -->
 <div class="modal-overlay" id="editKeyModal">
@@ -980,7 +1016,7 @@ function showPage(p){
     document.querySelector('[data-page="'+k+'"]')?.classList.toggle('active',k===p);
   });
   $('pageTitle').textContent=pages[p];
-  if(p==='dashboard'){loadStats();loadOnboarding();}
+  if(p==='dashboard'){loadStats();loadOnboarding();loadAccounts();}
   if(p==='usage')loadUsage();
   if(p==='accounts')loadAccounts();
   if(p==='apikeys')loadKeys();
@@ -1132,6 +1168,7 @@ async function loadAccounts(){
     const d=await api('/api/accounts');
     _accountsCache=d.accounts||[];
     renderAccounts();
+    renderQuotaDashboard();
   }catch(e){$('accountRows').innerHTML=`<tr><td colspan="8" class="empty">${e.message}</td></tr>`;}
 }
 
@@ -1195,6 +1232,7 @@ async function loadKeys(){
     const k=d.keys||[];
     $('keyRows').innerHTML=k.length?k.map(x=>`<tr><td><b>${x.name}</b></td><td><code>${x.prefix}</code></td><td style="font-size:12px;color:var(--muted)">${new Date(x.createdAt).toLocaleString()}</td><td>${x.revoked?'<span class="status offline"><i></i>Disabled</span>':'<span class="status online"><i></i>Active</span>'}</td><td style="font-size:12px;color:var(--muted)">${x.lastUsedAt?new Date(x.lastUsedAt).toLocaleString():'-'}</td><td style="text-align:right;white-space:nowrap">
       <button class="btn-sm btn" onclick="openUseKey('${x.id}')">Use key</button>
+      <button class="btn-sm btn" onclick="viewKey('${x.id}','${x.name.replace(/'/g,"\\'")}')">View</button>
       <button class="btn-sm btn" onclick="editKey('${x.id}','${x.name.replace(/'/g,"\\'")}')">Edit</button>
       <button class="btn-sm btn ${x.revoked?'success':'danger'}" onclick="toggleKey('${x.id}',${x.revoked})">${x.revoked?'Enable':'Disable'}</button>
       <button class="btn-sm btn danger" onclick="revokeKey('${x.id}')">Delete</button>
@@ -1712,6 +1750,111 @@ fetch('/api/admin/session').then(r=>r.json()).then(d=>{
   else if(d.authenticated){$('login').style.display='none';$('app').style.display='flex';showPage('dashboard');loadStats();loadOnboarding();}
   else{$('login').style.display='grid';}
 }).catch(()=>{$('login').style.display='grid';});
+// === 本地功能移植(方案1)===
+let viewKeyId=null;
+
+const QUOTA_LABELS={LLMOnly:'对话',ImageGeneration:'生图',GraphicArt:'GraphicArt',VisualCreator:'Visual创作',ClaudeOpusQuery:'Claude Opus',ClaudeOpusQuery75:'Claude 75',ClaudeOpusQueryC1:'Claude C1',ClaudeOpusQueryC2:'Claude C2',ClaudeOpusQueryDaily:'Claude 日限',ClaudeOpusQueryDailyC1:'Claude 日C1',ClaudeOpusQueryDailyC2:'Claude 日C2',ClaudeOpusQueryDailyWord:'Claude 日Word',ClaudeOpusQueryDev:'Claude Dev',ClaudeOpusQueryHourlyDev:'Claude 小时Dev',ClaudeOpusQueryWeeklyWord:'Claude 周Word',ArtifactGeneration:'产物',WXPAgentMode:'Agent',FileReference:'文件引用',CodeInterpreter:'代码解释',ImageAnalysis:'图像分析',DeepResearch:'深度研究',DeepWork:'DeepWork',CopilotTuning:'调优',NotebookCowork:'Notebook',PersonalDataAccess:'个人数据',TenantDataAccess:'租户数据',ReasoningModelTurnUsage:'推理',CostQuota:'成本'};
+const QUOTA_ICONS={LLMOnly:'message-circle',ImageGeneration:'image',ClaudeOpusQuery:'sparkles',ClaudeOpusQueryDaily:'calendar',ArtifactGeneration:'box',WXPAgentMode:'bot',FileReference:'file-text',CodeInterpreter:'code-2',ReasoningModelTurnUsage:'brain'};
+function renderQuotaDashboard(){
+  const list=_accountsCache||[];
+  const card=$('quotaDashboard'); if(!card) return;
+  if(!list.length){ card.style.display='none'; return; }
+  card.style.display='';
+  const totals={}; let withData=0;
+  list.forEach(x=>{
+    const r=x.remainingAllowance||{};
+    if(Object.keys(r).length) withData++;
+    Object.entries(r).forEach(([k,v])=>{ totals[k]=(totals[k]||0)+(Number(v)||0); });
+  });
+  const preferred=['LLMOnly','ImageGeneration','ClaudeOpusQuery','ClaudeOpusQueryDaily','ClaudeOpusQuery75','ArtifactGeneration','WXPAgentMode','FileReference'];
+  let keys=[...preferred.filter(k=>k in totals),...Object.keys(totals).filter(k=>!preferred.includes(k)).sort()];
+  keys=keys.filter(k=> totals[k]!==0 || ['LLMOnly','ImageGeneration','ClaudeOpusQuery'].includes(k));
+  const totalBadges=keys.map(k=>{
+    const v=totals[k]; const label=QUOTA_LABELS[k]||k; const icon=QUOTA_ICONS[k]||'layers';
+    const hint=k==='ImageGeneration'?`可再生 ${v} 张图`:k==='LLMOnly'?`可对话约 ${v} 次`:k.includes('Claude')?`Claude 剩余 ${v} 次`:`剩余 ${v}`;
+    const low=v<=10&&v>0, zero=v===0;
+    return `<div style="min-width:148px;flex:1;padding:12px;border-radius:12px;border:1px solid ${zero?'#fecaca':low?'#fde68a':'var(--line)'};background:var(--surface);box-shadow:var(--shadow-sm);animation:slideUp .3s var(--ease-out) both"><div style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)"><i data-lucide="${icon}" style="width:12px;height:12px"></i>${esc(label)} · ${esc(k)}</div><div style="font-size:22px;font-weight:700;margin-top:6px;letter-spacing:-0.02em;color:${zero?'var(--danger)':''}">${v}</div><div style="font-size:11px;color:var(--muted);margin-top:2px">${hint}</div></div>`;
+  }).join('');
+  $('quotaTotals').innerHTML=totalBadges?`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px">${totalBadges}</div>`:'<span style="font-size:12px;color:var(--muted)">暂无剩余额度数据，等待下一次请求回写</span>';
+  const cooldowns=list.filter(x=>x.cooldownUntil).sort((a,b)=>new Date(a.cooldownUntil)-new Date(b.cooldownUntil));
+  const now=Date.now();
+  const busy=list.filter(x=> (x.concurrency||0)>0).length;
+  const circuit=list.some(x=> x.globalCircuit==='open');
+  $('quotaCooldowns').innerHTML=cooldowns.length?cooldowns.map(x=>{
+    const until=new Date(x.cooldownUntil).getTime(); const left=Math.max(0,until-now); const mins=Math.ceil(left/60000);
+    const pct=Math.max(0,Math.min(100,Math.round((left/(15*60000))*100)));
+    const conc=x.concurrency?` · 并发 ${x.concurrency}`:''; const proxy=x.boundProxy?` · 代理 ${esc(x.boundProxy)}`:'';
+    return `<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--border);border-radius:10px;margin-top:8px;background:var(--surface)"><span style="font-size:12px;flex:1">${esc(x.email||x.displayName||x.id)} · 冷却中 · ${mins} 分钟后恢复${conc}${proxy}</span><span style="width:90px;height:6px;background:var(--border);border-radius:999px;overflow:hidden"><span style="display:block;height:100%;width:${pct}%;background:#d97706"></span></span></div>`;
+  }).join(''):`<div style="font-size:12px;color:var(--muted);margin-top:8px">无冷却账号 · 调度可用${busy?` · ${busy} 并发中`:''}${circuit?' · 全局熔断开启':''}</div>`;
+  const avail=list.filter(x=>x.status==='online').length;
+  const total=list.length;
+  const over=list.filter(x=>x.meterError).length;
+  $('quotaSub').textContent=`${withData}/${total} 已同步额度 · ${avail} 可调度${busy?` · ${busy} 并发`:''}` + (over?` · ${over} 限流`:'') + (circuit?' · 熔断':'');
+  $('quotaAdvice').textContent=avail===0?'全部账号冷却中，等待恢复或增加账号':'生图为 0 的账号仍可接纯文本请求';
+  try{ lucide.createIcons(); }catch(e){}
+}
+async function viewKey(id,name){
+  viewKeyId=id;
+  $('viewKeyName').textContent=name||'';
+  $('viewKeyLoading').style.display='block';
+  $('viewKeyResult').style.display='none';
+  $('viewKeyLegacy').style.display='none';
+  $('viewKeyModal').classList.add('open');
+  try{
+    const d=await api('/api/admin/keys?id='+encodeURIComponent(id));
+    $('viewKeyValue').value=d.key||'';
+    $('viewKeyLoading').style.display='none';
+    $('viewKeyResult').style.display='block';
+  }catch(e){
+    $('viewKeyLoading').style.display='none';
+    if(/(not_recoverable|无法|before reveal)/i.test(e.message||'')){$('viewKeyLegacy').style.display='block';}
+    else{showNotice(e.message,'error');}
+  }
+}
+function closeViewKey(){$('viewKeyModal').classList.remove('open');viewKeyId=null;}
+async function copyViewKey(){try{await navigator.clipboard.writeText($('viewKeyValue').value);showNotice('已复制','success');}catch(e){}}
+async function changeAdminPassword(){
+  const cur=$('cpCurrent').value, nw=$('cpNew').value, cf=$('cpConfirm').value;
+  if(!cur){showNotice('请输入当前密码','error');return;}
+  if(nw.length<6){showNotice('新密码长度至少为 6 个字符','error');return;}
+  if(nw!==cf){showNotice('两次输入的新密码不一致','error');return;}
+  try{
+    await api('/api/admin/change-password',{method:'POST',body:JSON.stringify({current_password:cur,new_password:nw})});
+    $('cpCurrent').value=$('cpNew').value=$('cpConfirm').value='';
+    showNotice('密码修改成功，请用新密码重新登录','success');
+    setTimeout(()=>location.replace('/login'),1500);
+  }catch(e){showNotice(e.message,'error');}
+}
+async function exportBackup(){
+  try{
+    const r=await fetch('/api/admin/export');
+    if(!r.ok){const t=await r.text();throw Error(t);}
+    const b=await r.blob();
+    const m=(r.headers.get('Content-Disposition')||'').match(/filename="?([^";]+)/);
+    const name=m?m[1]:('m365-backup-'+new Date().toISOString().replace(/[:T]/g,'-').slice(0,19)+'.zip');
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(b);a.download=name;
+    document.body.appendChild(a);a.click();a.remove();
+    setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+    showNotice('备份已下载','success');
+  }catch(e){showNotice(e.message,'error');}
+}
+async function importBackup(file){
+  if(!file)return;
+  $('importBackupFile').value='';
+  if(!confirm('导入备份将覆盖当前全部数据（账号、API 密钥、会话、对话、管理密码），导入后服务会自动重启。\n\n确认继续？'))return;
+  const fd=new FormData();fd.append('file',file);
+  try{
+    const r=await fetch('/api/admin/import',{method:'POST',body:fd});
+    const t=await r.text();let d;try{d=JSON.parse(t);}catch{d={error:{message:t}};}
+    if(!r.ok)throw Error(d?.error?.message||t||'导入失败');
+    const el=$('backupResult');el.style.display='block';
+    const warn=(d.warnings&&d.warnings.length)?('<br><span style="color:#e0a63c">⚠️ '+d.warnings.join('<br>⚠️ ')+'</span>'):'';
+    el.innerHTML='<div class="highlight-box success"><b>导入成功</b>，服务正在重启…<br>恢复: '+(d.restored||[]).join(', ')+'<br>账号 '+d.accounts+' · 密钥 '+d.api_keys+' · 会话 '+d.sessions+'（'+d.messages+' 条消息）· 对话 '+d.conversations+warn+'</div>';
+    setTimeout(()=>location.reload(),2500);
+  }catch(e){showNotice(e.message,'error');}
+}
+
 </script>
 </body>
 </html>
