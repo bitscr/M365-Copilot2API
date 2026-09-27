@@ -27,6 +27,8 @@ import (
 // Callers must independently probe the account before marking it unhealthy.
 var ErrRateLimitNotice = errors.New("upstream rate-limit notice")
 
+var ErrFirstTokenTimeout = errors.New("upstream first text token timeout")
+
 var ErrEmptyCompletion = errors.New("upstream returned empty completion; tone may be unavailable for this tenant")
 
 var ErrImageLimit = errors.New("upstream image generation daily limit reached")
@@ -228,6 +230,8 @@ type Request struct {
 	Tools                 []Tool
 	ToolChoice            any
 	MCPServerURL          string
+	DisableWebSearch      bool
+	FirstTokenTimeout     time.Duration
 	Started               bool
 	ConversationSignature string
 	PreviousMessages      []ContextMessage
@@ -737,9 +741,23 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			}
 		}
 	}()
+	var firstTokenTimer *time.Timer
+	var firstTokenTimeoutCh <-chan time.Time
+	if req.FirstTokenTimeout > 0 {
+		firstTokenTimer = time.NewTimer(req.FirstTokenTimeout)
+		firstTokenTimeoutCh = firstTokenTimer.C
+		defer firstTokenTimer.Stop()
+	}
 	for time.Now().Before(deadline) {
 		var read wsRead
 		select {
+		case <-firstTokenTimeoutCh:
+			if !firstServiceResponse {
+				returnConn = false
+				_ = conn.Close()
+				return Result{}, ErrFirstTokenTimeout
+			}
+			firstTokenTimeoutCh = nil
 		case <-ctx.Done():
 			returnConn = false
 			_ = conn.Close()
@@ -1436,7 +1454,7 @@ func chatPayload(req Request, requestID string, firstTurn bool) string {
 	if deviceOS == "" {
 		deviceOS = "Windows"
 	}
-	text := toolProtocolPrompt(req.Text, req.Tools, req.ToolChoice, len(clientPlugins(req.Tools, req.MCPServerURL)) > 0)
+	text := toolProtocolPrompt(req.Text, req.Tools, req.ToolChoice, len(clientPlugins(req.Tools, req.MCPServerURL, req.DisableWebSearch)) > 0)
 	// ChatHub's UploadFile endpoint only accepts the UploadImage scenario, which
 	// rejects non-image payloads (probed: application/pdf -> InvalidFileDataUri,
 	// a faked image MIME -> InternalError). A document that failed to upload has
@@ -1633,7 +1651,7 @@ func chatPayload(req Request, requestID string, firstTurn bool) string {
 		"streamingMode":    "ConciseWithPadding",
 		"message":          message,
 
-		"plugins":                   clientPlugins(req.Tools, req.MCPServerURL),
+		"plugins":                   clientPlugins(req.Tools, req.MCPServerURL, req.DisableWebSearch),
 		"extraExtensionParameters":  map[string]any{},
 		"isSbsSupported":            true,
 		"renderReferencesBehindEOS": true,

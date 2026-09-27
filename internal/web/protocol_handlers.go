@@ -121,8 +121,8 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	innerDone := make(chan struct{})
 	go func() {
 		defer func() {
-			if rec := recover(); rec != nil {
-				log.Printf("[responses] inner goroutine panic: %v", rec)
+			if r := recover(); r != nil {
+				log.Printf("[responses] inner goroutine panic: %v", r)
 			}
 			_ = pw.Close()
 			close(innerDone)
@@ -130,16 +130,21 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		s.openaiChat(irw, r2)
 	}()
 
-	writeSSEHeaders(w)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
 	flusher, _ := w.(http.Flusher)
-	ss := newResponsesSSEStream(r, w, flusher, model)
+	emit := func(name string, v any) error {
+		return writeSSE(r, w, flusher, name, v)
+	}
 	id := "resp_" + uuid.NewString()
 	created := time.Now().Unix()
-	if err := ss.emitCreated(id, model, created); err != nil {
-		return
-	}
+	emit("response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "object": "response", "status": "in_progress", "model": model, "output": []any{}}})
 
-	ts := newResponsesTextStream(ss)
+	var text strings.Builder
+	messageID := "msg_" + uuid.NewString()
+	contentID := "txt_" + uuid.NewString()
+	textStarted := false
 	type tcState struct {
 		ID, Name, Args, Type string
 		ItemID               string
@@ -147,23 +152,12 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	calls := map[int]*tcState{}
 	scanner := bufio.NewScanner(pr)
 	scanner.Buffer(make([]byte, 4096), 2<<20)
-	sawDone := false
 	for scanner.Scan() {
 		if r.Context().Err() != nil {
 			return
 		}
 		line := scanner.Text()
-		if line == "data: [DONE]" {
-			// Record the terminal marker but keep draining the pipe: the inner
-			// openaiChat keeps writing after [DONE] (the ": m365-metrics" trace
-			// frame) and io.Pipe is synchronous, so stopping the reader here
-			// wedges the inner goroutine, which never closes the pipe and never
-			// closes innerDone -- the outer handler then blocks forever and the
-			// client sees "stream disconnected before completion".
-			sawDone = true
-			continue
-		}
-		if !strings.HasPrefix(line, "data: ") {
+		if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
 			continue
 		}
 		var chunk map[string]any
@@ -177,14 +171,12 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		choice, _ := choices[0].(map[string]any)
 		delta, _ := choice["delta"].(map[string]any)
 		if content, ok := delta["content"].(string); ok && content != "" {
-			// UTF-8 boundary repair: the upstream frames bytes, so a Chinese
-			// character split across two deltas would otherwise reach the client
-			// as replacement characters (the reported mojibake for external
-			// clients). Only bytes actually emitted are accumulated so the
-			// terminal output_text.done matches the delta stream exactly.
-			if err := ts.Append(content); err != nil {
-				return
+			text.WriteString(content)
+			if !textStarted {
+				textStarted = true
+				emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}}}})
 			}
+			emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": messageID, "delta": content})
 		}
 		if rawCalls, ok := delta["tool_calls"].([]any); ok {
 			for _, raw := range rawCalls {
@@ -202,81 +194,65 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 				if v, ok := tc["type"].(string); ok && v == "custom" {
 					typ = "custom"
 				}
+				// Resolve call identity before emitting the added frame so
+				// Responses clients receive a usable function_call item with
+				// call_id/name already set (issue #77).
+				callID, _ := tc["id"].(string)
+				fn, _ := tc["function"].(map[string]any)
+				name, _ := fn["name"].(string)
+				args, _ := fn["arguments"].(string)
 				if st == nil {
 					prefix := "fc_"
-					item := map[string]any{"type": "function_call", "call_id": "", "name": "", "arguments": "", "status": "in_progress"}
+					item := map[string]any{"type": "function_call", "call_id": callID, "name": name, "arguments": "", "status": "in_progress"}
 					if typ == "custom" {
 						prefix = "ctc_"
-						item = map[string]any{"type": "custom_tool_call", "call_id": "", "name": "", "input": "", "status": "in_progress"}
+						item = map[string]any{"type": "custom_tool_call", "call_id": callID, "name": name, "input": "", "status": "in_progress"}
 					}
-					st = &tcState{ItemID: prefix + uuid.NewString(), Type: typ}
+					st = &tcState{ItemID: prefix + uuid.NewString(), Type: typ, ID: callID, Name: name}
 					calls[idx] = st
 					item["id"] = st.ItemID
-					_ = ss.emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": idx, "item": item})
+					emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": idx, "item": item})
+				} else {
+					if callID != "" {
+						st.ID = callID
+					}
+					if name != "" {
+						st.Name += name
+					}
 				}
-				if v, ok := tc["id"].(string); ok {
-					st.ID = v
-				}
-				fn, _ := tc["function"].(map[string]any)
-				if v, ok := fn["name"].(string); ok {
-					st.Name += v
-				}
-				if v, ok := fn["arguments"].(string); ok {
-					st.Args += v
+				if args != "" {
+					st.Args += args
 					if st.Type != "custom" {
-						_ = ss.emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": idx, "item_id": st.ItemID, "delta": v})
+						emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": idx, "item_id": st.ItemID, "delta": args})
 					}
 				}
 			}
 		}
 	}
-	// Drain anything left in the pipe so the inner writer never blocks on a
-	// synchronous io.Pipe write (it writes the ": m365-metrics" trace after
-	// [DONE]); a blocked inner writer would never close the pipe nor innerDone.
-	_, _ = io.Copy(io.Discard, pr)
-	// Bound the wait: even if the inner goroutine is wedged, fail the response
-	// instead of hanging the client's connection indefinitely.
-	select {
-	case <-innerDone:
-	case <-time.After(5 * time.Second):
-		log.Printf("[responses] inner chat goroutine did not finish in time; proceeding")
-	}
-
-	// Release any rune held back by the boundary repair before deciding whether
-	// the stream is empty.
-	if err := ts.Flush(); err != nil {
-		return
-	}
-
-	if scanner.Err() != nil || irw.status >= http.StatusBadRequest || !sawDone {
+	<-innerDone
+	if scanner.Err() != nil || irw.status >= http.StatusBadRequest {
 		status := irw.status
-		code := fmt.Sprint(status)
-		message := "inner chat request failed"
-		if !sawDone && scanner.Err() == nil && irw.status < http.StatusBadRequest {
-			code = "missing_done_event"
-			message = "inner chat stream ended without a [DONE] event"
-		} else if status == 0 {
+		if status == 0 {
 			status = http.StatusBadGateway
-			code = fmt.Sprint(status)
 		}
-		_ = ss.emit("response.failed", map[string]any{
+		emit("response.failed", map[string]any{
 			"type": "response.failed",
 			"response": map[string]any{
 				"id": id, "object": "response", "status": "failed", "model": model,
-				"error": responsesError(code, message),
+				"error": map[string]any{"code": status, "message": "inner chat request failed"},
 			},
 		})
 		return
 	}
-	if len(calls) == 0 && strings.TrimSpace(ts.Text()) == "" {
+	if len(calls) == 0 && strings.TrimSpace(text.String()) == "" {
 		// Never leave a Responses stream after response.created without a
 		// terminal event: clients otherwise render this as a successful blank
 		// answer and may reuse an incomplete response on the next turn.
-		_ = ss.emit("response.failed", map[string]any{
+		emit("response.failed", map[string]any{
 			"type": "response.failed",
 			"response": map[string]any{
 				"id": id, "object": "response", "status": "failed", "model": model,
-				"error": responsesError("empty_upstream_response", "ChatHub returned no text or tool call"),
+				"error": map[string]any{"code": "empty_upstream_response", "message": "ChatHub returned no text or tool call"},
 			},
 		})
 		return
@@ -297,29 +273,35 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 				input := customToolInput(st.Args)
 				item := map[string]any{"type": "custom_tool_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "input": input, "status": "completed"}
 				output = append(output, item)
-				_ = ss.emit("response.custom_tool_call_input.delta", map[string]any{"type": "response.custom_tool_call_input.delta", "output_index": i, "item_id": item["id"], "delta": input})
-				_ = ss.emit("response.custom_tool_call_input.done", map[string]any{"type": "response.custom_tool_call_input.done", "output_index": i, "item_id": item["id"], "input": input})
-				_ = ss.emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
+				emit("response.custom_tool_call_input.delta", map[string]any{"type": "response.custom_tool_call_input.delta", "output_index": i, "item_id": item["id"], "delta": input})
+				emit("response.custom_tool_call_input.done", map[string]any{"type": "response.custom_tool_call_input.done", "output_index": i, "item_id": item["id"], "input": input})
+				emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
 				continue
 			}
 			item := map[string]any{"type": "function_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "arguments": st.Args, "status": "completed"}
 			output = append(output, item)
-			_ = ss.emit("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "output_index": i, "item_id": st.ItemID, "arguments": st.Args})
-			_ = ss.emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
+			emit("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "output_index": i, "item_id": st.ItemID, "arguments": st.Args})
+			emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
 		}
 	} else {
-		// Finish closes the text item: it emits output_text.done and
-		// output_item.done from the same accumulated text the deltas carried.
-		// Restating the body here is what duplicated answers for clients before.
-		output = append(output, ts.Finish())
+		item := map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}}}
+		output = append(output, item)
+		if !textStarted {
+			emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": item})
+			emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": messageID, "delta": text.String()})
+		}
+		emit("response.output_text.done", map[string]any{"type": "response.output_text.done", "output_index": 0, "content_index": 0, "item_id": messageID, "text": text.String()})
+		item["status"] = "completed"
+		item["content"] = []any{map[string]any{"type": "output_text", "id": contentID, "text": text.String(), "annotations": []any{}}}
+		emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": item})
 	}
-	usageOutput := ts.Text()
+	usageOutput := text.String()
 	for _, call := range calls {
 		usageOutput += call.Name + call.Args
 	}
 	estimate := estimateResponsesUsage(model, o.Messages, o.Tools, o.ToolChoice, usageOutput)
 	resp := map[string]any{"id": id, "object": "response", "created_at": created, "status": "completed", "model": model, "output": output, "usage": estimate.Values, "m365": localUsageMetadata(estimate.Source)}
-	_ = ss.emit("response.completed", map[string]any{"type": "response.completed", "response": resp})
+	emit("response.completed", map[string]any{"type": "response.completed", "response": resp})
 }
 
 func (s *Server) runOpenAIAdapter(r *http.Request, o oaiReq) (map[string]any, []byte, int, error) {

@@ -64,9 +64,12 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 			s.accountPool.MarkImageLimited(acc.ID)
 		}
+		s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 		writeUpstreamError(w, err)
 		return
 	}
+	s.accountPool.MarkSuccess(acc.ID)
+	s.applyResultMetering(acc.ID, res)
 	if body.SessionKey != "" {
 		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: text})
 	}
@@ -177,13 +180,23 @@ func ParseMetering(accountID string, items json.RawMessage) (meterError string, 
 	if json.Unmarshal(items, &parsed) != nil {
 		return "", hasAccess
 	}
+	denied := false
 	for _, mi := range parsed {
-		if !mi.HasAccess {
-			hasAccess = false
-			if meterError == "" {
-				meterError = mi.MeterError
-			}
+		if mi.MeterError != "" {
+			meterError = mi.MeterError
+			// A denied capability must win regardless of item order: a later
+			// hasAccess=true in a stale sibling item would otherwise mask the
+			// denial and the pool would keep routing traffic to a throttled
+			// account.
+			denied = true
+			continue
 		}
+		if !denied {
+			hasAccess = mi.HasAccess
+		}
+	}
+	if denied {
+		hasAccess = false
 	}
 	if meterError != "" {
 		log.Printf("[metering] account=%s meterError=%q hasAccess=%v", accountID, meterError, hasAccess)
@@ -223,5 +236,33 @@ func applyMeteringCooldown(pool *accountHealth, accountID string, meterError str
 	case "ImageGenSystemCapacityThrottled":
 		pool.MarkImageGenSystemThrottled(accountID)
 		log.Printf("[metering] account=%s imageGenSystemCooldown=30m", accountID)
+	}
+}
+
+// applyResultMetering 统一处理一轮聊天结果的 throttling/metering：
+// 更新配额计数、触发图片能力冷却、记录剩余额度趋势。主路径与 stream 路径共用，
+// 避免只有 /api/chat/stream 生效而 /v1/chat/completions 漏掉风控信号。
+func (s *Server) applyResultMetering(accountID string, res chathub.Result) {
+	if s.accountPool == nil {
+		return
+	}
+	if res.Throttling != nil {
+		s.accountPool.UpdateThrottling(accountID, res.Throttling)
+		s.logThrottlingWarning(accountID, res.Throttling)
+	}
+	if res.MeteringInformation == nil {
+		return
+	}
+	miRaw, err := json.Marshal(res.MeteringInformation)
+	if err != nil {
+		return
+	}
+	mErr, hasAccess := ParseMetering(accountID, json.RawMessage(miRaw))
+	applyMeteringCooldown(s.accountPool, accountID, mErr)
+	if remaining := remainingAllowances(res.Throttling); len(remaining) > 0 {
+		log.Printf("[metering] account=%s remainingAllowance=%v", accountID, remaining)
+	}
+	if mErr != "" || !hasAccess {
+		log.Printf("[metering] account=%s hasAccess=%v meterError=%q", accountID, hasAccess, mErr)
 	}
 }

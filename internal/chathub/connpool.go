@@ -12,6 +12,14 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// poolEligibleFor reports whether a request may reuse a pooled connection.
+// Continuation requests (carrying conversation/session ids) must never take
+// from or return to the pool: the pooled socket is bound to random URL ids
+// and a continuation would complete immediately with no text. (community PR #62/#86)
+func poolEligibleFor(req Request) bool {
+	return req.ConversationID == "" && req.SessionID == ""
+}
+
 type pooledConn struct {
 	conn      *websocket.Conn
 	created   time.Time
@@ -204,9 +212,19 @@ func (p *ConnPool) WarmWithProbe(ctx context.Context, acc Account, wsURL string)
 }
 
 func (p *ConnPool) Return(oid, tid string, conn *websocket.Conn) {
-	if conn != nil {
-		conn.Close()
+	if conn == nil {
+		return
 	}
+	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetWriteDeadline(time.Time{})
+	key := p.key(oid, tid)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.conns[key]) >= maxPoolPerKey {
+		conn.Close()
+		return
+	}
+	p.conns[key] = append(p.conns[key], &pooledConn{conn: conn, created: time.Now(), handshook: true})
 }
 
 func (p *ConnPool) Discard(oid, tid string, conn *websocket.Conn) {

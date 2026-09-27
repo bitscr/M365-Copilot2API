@@ -27,7 +27,13 @@ type flagsCacheEntry struct {
 }
 
 func (s *Server) memoryAccount(r *http.Request) (auth.AccountToken, bool) {
-	acc, err := s.resolveAccount("")
+	// 记忆/人设绑定到具体账号，避免共享账号池下不同 API-Key 交叉污染（HAR 报告 04 §9）。
+	// 仅管理员会话可指定 account_id，普通 API-Key 请求仍走默认选号，防止越权读取他人记忆。
+	requested := ""
+	if s.validAdminSession(r) {
+		requested = firstNonEmpty(r.URL.Query().Get("account_id"), r.Header.Get("X-M365-Account"))
+	}
+	acc, err := s.resolveAccount(requested)
 	if err != nil {
 		return auth.AccountToken{}, false
 	}

@@ -82,8 +82,12 @@ func TestAgentLedgerMemoryRetryTolerant(t *testing.T) {
 		{Role: "tool", ToolCallID: "call_b", Content: `{"output":"x"}`},
 		{Role: "assistant", ToolCalls: []map[string]any{{"id": "call_c", "type": "function", "function": map[string]any{"name": "terminal", "arguments": `{"command":"probe"}`}}}},
 		{Role: "tool", ToolCallID: "call_c", Content: `{"output":"x"}`},
+		{Role: "assistant", ToolCalls: []map[string]any{{"id": "call_d", "type": "function", "function": map[string]any{"name": "terminal", "arguments": `{"command":"probe"}`}}}},
+		{Role: "tool", ToolCallID: "call_d", Content: `{"output":"x"}`},
+		{Role: "assistant", ToolCalls: []map[string]any{{"id": "call_e", "type": "function", "function": map[string]any{"name": "terminal", "arguments": `{"command":"probe"}`}}}},
+		{Role: "tool", ToolCallID: "call_e", Content: `{"output":"x"}`},
 	}
 	if l2 := buildAgentLedger(msgs2); !l2.StuckLoop {
-		t.Fatal("non-memory 3x identical call must STILL be StuckLoop")
+		t.Fatal("non-memory 5x identical call must STILL be StuckLoop")
 	}
 }

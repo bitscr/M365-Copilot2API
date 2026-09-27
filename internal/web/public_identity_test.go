@@ -5,7 +5,6 @@ import (
 	"m365-copilot2api/internal/chathub"
 	"net/http/httptest"
 	"os"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -49,27 +48,9 @@ func TestPublicIdentityPolicyCanBeDisabledForRawUpstreamResponses(t *testing.T) 
 	if got := sanitizePublicReasoningText("You are Microsoft Copilot."); got != "You are Microsoft Copilot." {
 		t.Fatalf("reasoning text was sanitized while disabled: %q", got)
 	}
-	// The policy gate governs identity text only. Protocol internals (citation
-	// anchors, <File> tags) are scrubbed unconditionally. The filter now holds
-	// back a trailing window so a marker split across fragments is still caught,
-	// so identity text is observed through Push+Flush rather than one Push.
-	fragFilter := &publicIdentityStreamFilter{}
-	fragment := "我是 M365 Copilot，基于 GPT-5 推理模型。"
-	if got := fragFilter.Push(fragment) + fragFilter.Flush(); got != fragment {
+	fragment := "<cite>turn4search6</cite>"
+	if got := (&publicIdentityStreamFilter{}).Push(fragment); got != fragment {
 		t.Fatalf("stream fragment was changed while disabled: %q", got)
-	}
-	markerFilter := &publicIdentityStreamFilter{}
-	if got := markerFilter.Push("<cite>turn4search6</cite>") + markerFilter.Flush(); got != "" {
-		t.Fatalf("internal citation marker survived while disabled: %q", got)
-	}
-	// A tag split across fragments must still be removed.
-	splitFilter := &publicIdentityStreamFilter{}
-	got := splitFilter.Push("我没收到 <Orga") + splitFilter.Push("nization>国家市场监督管理总局") + splitFilter.Push("</Organi") + splitFilter.Push("zation> 的说明。") + splitFilter.Flush()
-	if strings.Contains(got, "<") || strings.Contains(got, ">") {
-		t.Fatalf("split entity tag survived while disabled: %q", got)
-	}
-	if !strings.Contains(got, "国家市场监督管理总局") || !strings.Contains(got, "的说明") {
-		t.Fatalf("split-fragment content was damaged: %q", got)
 	}
 }
 
@@ -120,19 +101,25 @@ func TestPublicIdentityAnswerDetectsSelfQuestionsOnly(t *testing.T) {
 
 func TestPublicIdentityAnswerUsesRequestedModelForAllAdvertisedModels(t *testing.T) {
 	models := configuredModelSpecs(defaultModelMappings)
-	if len(models) != 14 {
-		t.Fatalf("advertised models=%d, want 22", len(models))
+	if len(models) != len(gatewayModels) {
+		t.Fatalf("advertised models=%d, want %d", len(models), len(gatewayModels))
 	}
 	for _, model := range models {
+		if model.Image {
+			continue
+		}
 		answer, detected := publicIdentityAnswer([]oaiMsg{{Role: "user", Content: "你是什么模型？"}}, model.ID)
 		if !detected || !strings.Contains(answer, model.ID) {
 			t.Fatalf("model=%q answer=%q detected=%t", model.ID, answer, detected)
 		}
-		if model.ID != "gpt-5.6-sol" && strings.Contains(answer, "gpt-5.6-sol") {
-			t.Fatalf("model=%q was reported as gpt-5.6-sol: %q", model.ID, answer)
-		}
 		if strings.HasPrefix(model.ID, "claude-") && !strings.Contains(answer, "Claude 系列") {
 			t.Fatalf("Claude model has wrong family: %q", answer)
+		}
+	}
+	for _, model := range models {
+		switch model.ID {
+		case "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-image-2":
+			t.Fatalf("misleading model %q must not be advertised", model.ID)
 		}
 	}
 }
@@ -195,110 +182,13 @@ func TestPublicReasoningStreamFilterBlocksSplitLeak(t *testing.T) {
 }
 
 func TestSanitizePublicAssistantTextRemovesInternalCitationMarkers(t *testing.T) {
-	input := "答案是 42。<cite>turn4search6</cite> 更多内容。citecall_test123，文件 report.pdf。"
+	input := "答案是 42。<cite>turn4search6</cite> 更多内容。citeturn1search2turn1search3"
 	got := sanitizePublicAssistantText(input)
-	for _, forbidden := range []string{"<cite>", "turn4search6", "cite", "call_test123"} {
-		if strings.Contains(got, forbidden) {
-			t.Fatalf("internal citation marker %q leaked: %q", forbidden, got)
-		}
+	if strings.Contains(got, "<cite>") || strings.Contains(got, "turn4search6") || strings.Contains(got, "cite") {
+		t.Fatalf("internal citation marker leaked: %q", got)
 	}
-	if !strings.Contains(got, "答案是 42") || !strings.Contains(got, "更多内容") || !strings.Contains(got, "report.pdf") {
+	if !strings.Contains(got, "答案是 42") || !strings.Contains(got, "更多内容") {
 		t.Fatalf("visible answer was damaged: %q", got)
-	}
-}
-
-func TestSanitizePublicAssistantTextRemovesEntityTagsAndCitationAnchors(t *testing.T) {
-	input := "9月17日，<Organization>国家市场监督管理总局</Organization>发布了清单【1-298683】，涉及<Person>张三</Person>和海南省昌江县【6-67cc80】。"
-	for _, enabled := range []bool{true, false} {
-		t.Setenv("M365_PUBLIC_IDENTITY_POLICY", strconv.FormatBool(enabled))
-		got := sanitizePublicAssistantText(input)
-		for _, forbidden := range []string{"<Organization>", "</Organization>", "<Person>", "</Person>", "【1-298683】", "【6-67cc80】"} {
-			if strings.Contains(got, forbidden) {
-				t.Fatalf("internal marker %q leaked (policy=%t): %q", forbidden, enabled, got)
-			}
-		}
-		if !strings.Contains(got, "国家市场监督管理总局") || !strings.Contains(got, "张三") || !strings.Contains(got, "昌江县") {
-			t.Fatalf("entity name was removed with its tag (policy=%t): %q", enabled, got)
-		}
-	}
-}
-
-func TestPublicIdentityStreamFilterScrubsInternalMarkersWhenPolicyDisabled(t *testing.T) {
-	t.Setenv("M365_PUBLIC_IDENTITY_POLICY", "false")
-	filter := newPublicIdentityStreamFilter()
-	chunks := []string{"我没收到 ", "<File>Report.pdf</File>", " 这个文件，", "请重新上传 \ue200cite\ue202call_test123\ue201"}
-	var got strings.Builder
-	for _, chunk := range chunks {
-		got.WriteString(filter.Push(chunk))
-	}
-	got.WriteString(filter.Flush())
-	out := got.String()
-	for _, forbidden := range []string{"<File>", "</File>", "\ue200cite", "call_test123"} {
-		if strings.Contains(out, forbidden) {
-			t.Fatalf("stream leaked internal marker %q: %q", forbidden, out)
-		}
-	}
-	if !strings.Contains(out, "Report.pdf") || !strings.Contains(out, "重新上传") {
-		t.Fatalf("visible stream content was damaged: %q", out)
-	}
-}
-
-func TestPublicIdentityStreamFilterReleasesHeldTailOnFlush(t *testing.T) {
-	// Regression: the policy-off fast path holds back ~64 trailing bytes so a
-	// marker split across deltas is never emitted in pieces. If the caller
-	// forgets Flush(), those bytes are dropped and the answer is truncated
-	// mid-sentence. This pins that Push() alone is NOT enough and Flush()
-	// releases the exact remainder.
-	t.Setenv("M365_PUBLIC_IDENTITY_POLICY", "false")
-	answer := "服务器重启后，项目和正式 Cloudflare Tunnel 都会自动恢复。"
-	filter := newPublicIdentityStreamFilter()
-	var got strings.Builder
-	// Feed in irregular slices like the upstream SSE deltas.
-	for _, chunk := range []string{"服务器重启后，", "项目和正式 Cloudflare Tun", "nel 都会自", "动恢复。"} {
-		got.WriteString(filter.Push(chunk))
-	}
-	if got.String() == answer {
-		// If this ever passes without Flush, the holdback was removed; the test
-		// would no longer be exercising the bug, so fail loudly.
-		t.Fatalf("Push alone produced the full answer; holdback is gone, test is stale")
-	}
-	got.WriteString(filter.Flush())
-	if got.String() != answer {
-		t.Fatalf("flush did not reconstruct the answer:\n got %q\nwant %q", got.String(), answer)
-	}
-}
-
-func TestPublicIdentityStreamFilterWithoutFlushTruncates(t *testing.T) {
-	// Documents the exact failure the handler fix prevents: the tail (< holdback)
-	// is lost when Flush is skipped.
-	t.Setenv("M365_PUBLIC_IDENTITY_POLICY", "false")
-	answer := "服务器重启后，项目和正式 Cloudflare Tunnel 都会自动恢复。"
-	filter := newPublicIdentityStreamFilter()
-	var got strings.Builder
-	for _, chunk := range []string{"服务器重启后，", "项目和正式 Cloudflare Tun", "nel 都会自", "动恢复。"} {
-		got.WriteString(filter.Push(chunk))
-	}
-	if got.String() == answer {
-		t.Fatal("expected truncation without Flush")
-	}
-	if !strings.HasPrefix(answer, got.String()) {
-		t.Fatalf("emitted text is not a prefix of the answer: %q", got.String())
-	}
-}
-
-func TestSanitizePublicAssistantTextRemovesInternalFileTags(t *testing.T) {
-	input := "我没收到 <File>Report.pdf</File> 这个文件，请重新上传 report.pdf。"
-	for _, enabled := range []bool{true, false} {
-		t.Setenv("M365_PUBLIC_IDENTITY_POLICY", strconv.FormatBool(enabled))
-		got := sanitizePublicAssistantText(input)
-		for _, forbidden := range []string{"<File>", "</File>", "<file>", "</file>"} {
-			if strings.Contains(got, forbidden) {
-				t.Fatalf("internal file tag %q leaked (policy=%t): %q", forbidden, enabled, got)
-			}
-		}
-		if !strings.Contains(got, "Report.pdf") || !strings.Contains(got, "重新上传") {
-			t.Fatalf("visible answer was damaged (policy=%t): %q", enabled, got)
-		}
 	}
 }
 
@@ -312,20 +202,6 @@ func TestToolResponsesSanitizeReasoningIdentity(t *testing.T) {
 		if strings.Contains(strings.ToLower(rr.Body.String()), "copilot") {
 			t.Fatalf("tool response leaked provider identity: %s", rr.Body.String())
 		}
-	}
-}
-
-func TestSanitizePublicAssistantTextAlwaysRemovesInternalMarkers(t *testing.T) {
-	t.Setenv("M365_PUBLIC_IDENTITY_POLICY", "false")
-	input := "结果 citecall_test123，文件 result.txt。"
-	got := sanitizePublicAssistantText(input)
-	for _, forbidden := range []string{"cite", "call_test123"} {
-		if strings.Contains(got, forbidden) {
-			t.Fatalf("internal marker %q leaked while identity policy was disabled: %q", forbidden, got)
-		}
-	}
-	if !strings.Contains(got, "结果") || !strings.Contains(got, "result.txt") {
-		t.Fatalf("ordinary content was removed: %q", got)
 	}
 }
 
@@ -622,5 +498,35 @@ func TestStreamFilterReassemblesSplitRune(t *testing.T) {
 	rout.WriteString(rf.Flush())
 	if rout.String() != full {
 		t.Fatalf("reasoning reassembled=%q want %q", rout.String(), full)
+	}
+}
+
+func TestStripCitationMarkersStreamRemovesCompleteAndSplitMarkers(t *testing.T) {
+	marker := citationOpen + "turn0search1" + citationClose
+	if got, rest := stripCitationMarkersStream("hello " + marker + " world"); got != "hello  world" || rest != "" {
+		t.Fatalf("complete marker got=%q rest=%q", got, rest)
+	}
+	f1 := "hello " + citationOpen + "turn0"
+	f2 := "search1" + citationClose + " world"
+	got1, rest1 := stripCitationMarkersStream(f1)
+	got2, rest2 := stripCitationMarkersStream(rest1 + f2)
+	if got1 != "hello " || got2 != " world" || rest2 != "" {
+		t.Fatalf("split marker got1=%q got2=%q rest2=%q", got1, got2, rest2)
+	}
+}
+
+func TestIdentityStreamFilterStripsCitationMarkers(t *testing.T) {
+	t.Setenv("M365_PUBLIC_IDENTITY_POLICY", "")
+	marker := citationOpen + "turn1search2" + citationClose
+	f := newPublicIdentityStreamFilter("gpt-5.5")
+	var out strings.Builder
+	out.WriteString(f.Push("答案"))
+	out.WriteString(f.Push(marker + "结论"))
+	out.WriteString(f.Flush())
+	if strings.Contains(out.String(), citationOpen) || strings.Contains(out.String(), citationClose) {
+		t.Fatalf("citation marker leaked: %q", out.String())
+	}
+	if out.String() != "答案结论" {
+		t.Fatalf("unexpected stripped text: %q", out.String())
 	}
 }

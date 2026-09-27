@@ -67,6 +67,12 @@ func upstreamStatus(err error) int {
 	if errors.Is(err, chathub.ErrImageLimit) {
 		return http.StatusTooManyRequests
 	}
+	// Local/transport failures reported as network_error must not be presented
+	// as upstream rate limiting (issue #79).
+	var netErr *UpstreamHTTPError
+	if errors.As(err, &netErr) && netErr.ErrorCode == "network_error" {
+		return http.StatusServiceUnavailable
+	}
 	if IsRateLimited(err) {
 		return http.StatusTooManyRequests
 	}
@@ -159,6 +165,11 @@ func writeUpstreamErrorWithAccount(w http.ResponseWriter, err error, accountID s
 		writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_content_blocked", "M365 content policy blocked this request; try again or switch account")
 		return
 	}
+	var netErr *UpstreamHTTPError
+	if errors.As(err, &netErr) && netErr.ErrorCode == "network_error" {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "network_error", netErr.Body)
+		return
+	}
 	code, msg := actionableUpstreamError(err)
 	log.Printf("upstream request failed: %v", err)
 	writeOpenAIError(w, status, code, msg)
@@ -226,6 +237,11 @@ func writeUpstreamError(w http.ResponseWriter, err error) {
 	}
 	if errors.Is(err, chathub.ErrOffensiveContent) {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_content_blocked", "M365 content policy blocked this request; try again or switch account")
+		return
+	}
+	var netErr *UpstreamHTTPError
+	if errors.As(err, &netErr) && netErr.ErrorCode == "network_error" {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "network_error", netErr.Body)
 		return
 	}
 	code, msg := actionableUpstreamError(err)

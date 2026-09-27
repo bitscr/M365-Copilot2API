@@ -9,6 +9,8 @@ import (
 	"unicode/utf8"
 )
 
+const maxCacheStatKeys = 1024
+
 type CacheStats struct {
 	mu sync.Mutex
 
@@ -97,6 +99,17 @@ func (s *CacheStats) RecordRequest(apiKey string, hit bool, tokensSent, tokensSa
 
 	ks, ok := s.KeyStats[apiKey]
 	if !ok {
+		if len(s.KeyStats) >= maxCacheStatKeys {
+			var oldestKey string
+			var oldest time.Time
+			for key, stat := range s.KeyStats {
+				if oldestKey == "" || stat.LastUsed.Before(oldest) {
+					oldestKey = key
+					oldest = stat.LastUsed
+				}
+			}
+			delete(s.KeyStats, oldestKey)
+		}
 		ks = &KeyStat{APIKey: apiKey}
 		s.KeyStats[apiKey] = ks
 	}

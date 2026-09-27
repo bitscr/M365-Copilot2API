@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -202,7 +204,7 @@ func IsRateLimited(err error) bool {
 	}
 	var httpErr *UpstreamHTTPError
 	if errors.As(err, &httpErr) {
-		if httpErr.Status == 429 || httpErr.Status == 503 {
+		if httpErr.Status == 429 {
 			return true
 		}
 		low := strings.ToLower(httpErr.Body)
@@ -212,14 +214,48 @@ func IsRateLimited(err error) bool {
 	}
 	var dialErr *chathub.DialError
 	if errors.As(err, &dialErr) {
-		if dialErr.Status == 429 || dialErr.Status == 503 {
+		if dialErr.Status == 429 {
 			return true
 		}
-		if dialErr.Kind == "QUOTA_429" || dialErr.Kind == "OVERLOAD_503" {
+		if dialErr.Kind == "QUOTA_429" {
 			return true
 		}
 	}
 	return false
+}
+
+func IsOverload(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *UpstreamHTTPError
+	if errors.As(err, &httpErr) && httpErr.Status == 503 {
+		return true
+	}
+	var dialErr *chathub.DialError
+	if errors.As(err, &dialErr) && (dialErr.Status == 503 || dialErr.Kind == "OVERLOAD_503") {
+		return true
+	}
+	return ClassifyError(err) == CategoryOverload503
+}
+
+func IsTransientTransport(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch ClassifyError(err) {
+	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS, CategoryWSHandshake, CategoryWSReadTimeout, CategoryOverload503:
+		return true
+	}
+	return false
+}
+
+func IsFailoverRetriable(err error) bool {
+	if IsRateLimited(err) || IsOverload(err) || IsAuthFailure(err) || IsTransientTransport(err) {
+		return true
+	}
+	// HAR 实证上游 422 属可重试成员，纳入故障转移白名单。
+	return ClassifyError(err) == CategoryRetryable422
 }
 
 func IsAuthFailure(err error) bool {
@@ -253,6 +289,30 @@ func RetryAfterSeconds(err error) int {
 	return 0
 }
 
+func transientThrottledCooldown() time.Duration {
+	n := envIntTransient()
+	if n < 5 {
+		n = 15
+	}
+	if n > 600 {
+		n = 600
+	}
+	return time.Duration(n) * time.Second
+}
+
+func envIntTransient() int {
+	v := 0
+	if s := strings.TrimSpace(os.Getenv("M365_TRANSIENT_THROTTLED_COOLDOWN_SECONDS")); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			v = n
+		}
+	}
+	if v == 0 {
+		v = 15
+	}
+	return v
+}
+
 func CooldownForCategory(cat ErrorCategory, retryAfter int, attempt int) time.Duration {
 	switch cat {
 	case CategoryQuota429:
@@ -269,7 +329,8 @@ func CooldownForCategory(cat ErrorCategory, retryAfter int, attempt int) time.Du
 		if attempt > 7 {
 			attempt = 7
 		}
-		d := 30 * time.Second * time.Duration(1<<(attempt-1))
+		base := transientThrottledCooldown()
+		d := base * time.Duration(1<<(attempt-1))
 		if d > 30*time.Minute || d <= 0 {
 			d = 30 * time.Minute
 		}
@@ -373,14 +434,12 @@ func (g *globalCircuitState) Record(err error) {
 	cat := ClassifyError(err)
 	switch cat {
 	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS, CategoryWSHandshake, CategoryWSReadTimeout:
-		// Only shared transport and infrastructure failures contribute to the
-		// global circuit. Account-, policy-, quota-, and request-specific errors
-		// are handled by per-account health state.
-	default:
-		// Client cancels are not upstream faults. Failures already classified
-		// as GLOBAL_UNAVAILABLE must not re-arm the circuit, otherwise traffic
-		// rejected while the circuit is open keeps renewing openUntil forever
-		// and the circuit can never close.
+default:
+		if cat == CategoryClientCanceled || cat == CategoryGlobalUnavailable {
+			return
+		}
+		// Only shared transport / infrastructure failures contribute to the global circuit.
+		// Quota, overload, auth, and request-specific errors are per-account.
 		return
 	}
 	g.mu.Lock()
@@ -427,11 +486,13 @@ type accountHealth struct {
 	imageGenCooldownUntil  map[string]time.Time
 	imageGenSystemCooldown map[string]time.Time
 	lastThrottling         map[string]any
-	lastMeterError         map[string]string
+lastMeterError         map[string]string
 	lastMeterAccess        map[string]bool
 	remainingAllowance     map[string]map[string]int
 	authFailReason         map[string]string
 	quotaAttempts          map[string]int
+	lastCategory           ErrorCategory
+	lastCategoryAt         time.Time
 }
 
 func newAccountHealth() *accountHealth {
@@ -452,6 +513,28 @@ func newAccountHealth() *accountHealth {
 		authFailReason:         map[string]string{},
 		quotaAttempts:          map[string]int{},
 	}
+}
+
+// LastCategory reports the most recent failure category recorded by
+// MarkFailure. resolveAccount uses it to distinguish local network failures
+// from upstream rate limiting (issue #79).
+func (h *accountHealth) LastCategory() (ErrorCategory, time.Time) {
+	if h == nil {
+		return CategoryUnknown, time.Time{}
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lastCategory, h.lastCategoryAt
+}
+
+// IsTransportCategory reports whether the category is a local/transport
+// failure rather than an upstream quota or auth rejection.
+func IsTransportCategory(cat ErrorCategory) bool {
+	switch cat {
+	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS, CategoryWSHandshake, CategoryWSReadTimeout, CategoryOverload503:
+		return true
+	}
+	return false
 }
 
 func (h *accountHealth) cleanupExpiredCooldownLocked(accountID string) {
@@ -663,6 +746,10 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 	if cat == CategoryClientCanceled {
 		return
 	}
+	h.mu.Lock()
+	h.lastCategory = cat
+	h.lastCategoryAt = time.Now()
+	h.mu.Unlock()
 	if cat == CategoryGlobalUnavailable {
 		h.mu.Lock()
 		h.cooldown[accountID] = time.Now().Add(CooldownForCategory(cat, 0, 1))
@@ -731,11 +818,13 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 	case CategoryOverload503:
 		delete(h.authFail, accountID)
 		delete(h.authFailReason, accountID)
+		delete(h.limited, accountID)
 		h.cooldown[accountID] = time.Now().Add(CooldownForCategory(cat, RetryAfterSeconds(err), 1))
 		return
 	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS, CategoryWSHandshake, CategoryWSReadTimeout:
 		delete(h.authFail, accountID)
 		delete(h.authFailReason, accountID)
+		delete(h.limited, accountID)
 		cd := CooldownForCategory(cat, 0, 1)
 		h.cooldown[accountID] = time.Now().Add(cd)
 		return

@@ -40,23 +40,7 @@ var publicProviderIdentityPattern = regexp.MustCompile(`(?i)` + publicProviderId
 var publicProviderSelfDescriptionPattern = regexp.MustCompile(`(?is)^\s*(?:you\s+are|this\s+is|the\s+(?:assistant|model)\s+is|` + publicProviderIdentityExpression + `\s*[,，:：-]).*(?:based\s+on|conversational\s+ai|ai\s+model|assistant|基于|对话式|模型)`)
 var publicLocalizedSelfIdentityPattern = regexp.MustCompile(`(?is)(?:私は|わたしは|저는|나는|soy|je\s+suis|ich\s+bin|sou|sono|я|أنا|ben|ik\s+ben|jestem|मैं|ฉัน|tôi\s+là)\s*(?:an?\s+|un(?:e)?\s+|ein(?:e)?\s+|uma?\s+|một\s+)?` + publicProviderIdentityExpression + `\b`)
 var publicReasoningLeakPattern = regexp.MustCompile(`(?is)(?:\byou\s+are\s+(?:an?\s+)?` + publicProviderIdentityExpression + `\b|\b(?:system|developer)\s+prompt\b|prompt\s+confidentiality|hidden\s+(?:instruction|prompt)|tool\s+protocol|(?:系统|开发者)提示(?:词)?|提示词保密|工具协议|` + publicProviderIdentityExpression + `\s+.*(?:based\s+on|conversational\s+ai|ai\s+model))`)
-var publicInternalCitationPattern = regexp.MustCompile(`(?i)(?:<cite>\s*(?:turn\d+(?:search|news|image)\d+|call_[a-z0-9_-]+)(?:\s*[,;]?\s*(?:turn\d+(?:search|news|image)\d+|call_[a-z0-9_-]+))*\s*</cite>|cite(?:(?:turn\d+(?:search|news|image)\d+|call_[a-z0-9_-]+))*)`)
-
-var publicInternalFilePattern = regexp.MustCompile(`(?i)</?\s*File\s*>`)
-
-// publicInternalEntityPattern matches the entity tags M365's annotator injects
-// around recognised proper nouns (</?Organization>, </?Person>, </?Location>,
-// ...). They are prompt-engineering scaffolding, not user-visible prose.
-//
-// publicInternalAnchorPattern matches the 【<ref>-<hex>】 citation anchors that
-// survive StripCitationMarkers when the reference id is not present in the
-// response's References map; the unresolvable anchor then leaks verbatim.
-var (
-	// Entity tags are PascalCase proper-noun markers; matching the shape rather
-	// than an enumerated list means a tag M365 adds later is still removed.
-	publicInternalEntityPattern = regexp.MustCompile(`</?[A-Z][A-Za-z0-9]{0,31}>`)
-	publicInternalAnchorPattern = regexp.MustCompile(`\x{3010}[0-9]+-[0-9a-fA-F]{4,}\x{3011}`)
-)
+var publicInternalCitationPattern = regexp.MustCompile(`(?i)(?:<cite>\s*turn\d+(?:search|news|image)\d+(?:\s*[,;]?\s*turn\d+(?:search|news|image)\d+)*\s*</cite>|cite(?:turn\d+(?:search|news|image)\d+)+)`)
 
 var publicSelfIdentityPattern = regexp.MustCompile(`(?i)(?:` +
 	`\b(?:i(?:\s+am|['’]m)|my\s+(?:name|identity)\s+is|this\s+(?:assistant|model)\s+is)` +
@@ -228,20 +212,8 @@ func sanitizePublicAssistantText(text string) string {
 	return sanitizePublicAssistantTextForModel(text, "")
 }
 
-// scrubPublicInternalMarkers removes protocol-internal markers (citation
-// anchors, entity tags and M365's <File> tags) unconditionally. They are wire
-// internals, not identity text, so they must never reach a client even when
-// the identity policy is disabled.
-func scrubPublicInternalMarkers(text string) string {
-	text = publicInternalCitationPattern.ReplaceAllString(text, "")
-	text = publicInternalFilePattern.ReplaceAllString(text, "")
-	text = publicInternalEntityPattern.ReplaceAllString(text, "")
-	return publicInternalAnchorPattern.ReplaceAllString(text, "")
-}
-
 func sanitizePublicAssistantTextForModel(text, model string) string {
 	text = stripReplacementChars(text)
-	text = scrubPublicInternalMarkers(text)
 	if !publicIdentityPolicyEnabled() {
 		return text
 	}
@@ -306,6 +278,49 @@ func utf8SafeCut(s string) int {
 		}
 	}
 	return n
+}
+
+var (
+	citationOpen  = string(rune(0xE200)) + "cite" + string(rune(0xE202))
+	citationClose = string(rune(0xE201))
+)
+
+// stripCitationMarkersStream removes upstream citation markers
+// (\uE200cite\uE202<id>\uE201) from a text fragment and returns the cleaned
+// prefix plus the unconsumed remainder, which is an incomplete marker to carry
+// over to the next fragment. It keeps public API responses free of the private
+// upstream citation control markup (issue #79).
+func stripCitationMarkersStream(pending string) (string, string) {
+	var b strings.Builder
+	for {
+		i := strings.Index(pending, citationOpen)
+		if i < 0 {
+			break
+		}
+		b.WriteString(pending[:i])
+		after := pending[i+len(citationOpen):]
+		j := strings.Index(after, citationClose)
+		if j < 0 {
+			// Incomplete marker: keep from the marker start.
+			return b.String(), pending[i:]
+		}
+		pending = after[j+len(citationClose):]
+	}
+	// Hold back a trailing partial marker prefix so a marker split across
+	// fragments is not emitted half-formed.
+	keep := 0
+	max := len(citationOpen) - 1
+	if max > len(pending) {
+		max = len(pending)
+	}
+	for n := max; n > 0; n-- {
+		if strings.HasSuffix(pending, citationOpen[:n]) {
+			keep = n
+			break
+		}
+	}
+	b.WriteString(pending[:len(pending)-keep])
+	return b.String(), pending[len(pending)-keep:]
 }
 
 func sanitizePublicReasoningText(text string) string {
@@ -471,6 +486,7 @@ func sanitizePublicJSONValue(value any) any {
 
 type publicIdentityStreamFilter struct {
 	pending         string
+	citePending     string
 	identityWritten bool
 	model           string
 }
@@ -483,46 +499,21 @@ func newPublicIdentityStreamFilter(models ...string) *publicIdentityStreamFilter
 	return &publicIdentityStreamFilter{model: model}
 }
 
-// publicIdentityStreamHoldback is the number of trailing bytes held back in the
-// policy-off fast path. Internal markers and entity tags can be split across SSE
-// fragments, so scrubbing each fragment in isolation misses a tag whose '<' and
-// '>' land in different fragments. Holding back a small tail and re-scrubbing
-// the concatenation closes that boundary.
-const publicIdentityStreamHoldback = 64
-
 func (f *publicIdentityStreamFilter) Push(fragment string) string {
 	if f == nil {
 		return sanitizePublicAssistantText(fragment)
 	}
-	f.pending += fragment
-	// Markers are scrubbed before the policy gate so a fragment carrying no
-	// identity text still gets its citation anchors, entity tags and <File> tags
-	// removed.
 	if !publicIdentityPolicyEnabled() {
-		if len(f.pending) <= publicIdentityStreamHoldback {
-			return ""
-		}
-		cut := len(f.pending) - publicIdentityStreamHoldback
-		for cut > 0 && !utf8.RuneStart(f.pending[cut]) {
-			cut--
-		}
-		// Never cut inside an unterminated '<...' tag or a … citation
-		// run: a marker split across fragments would otherwise be released in
-		// pieces and no regex could match it. Pull the cut back to the last
-		// unmatched opener.
-		if open := strings.LastIndexByte(f.pending[:cut], '<'); open >= 0 && !strings.ContainsRune(f.pending[open:cut], '>') {
-			cut = open
-		}
-		if open := strings.LastIndex(f.pending[:cut], "\ue200"); open >= 0 && !strings.ContainsRune(f.pending[open:cut], '\ue201') {
-			cut = open
-		}
-		if cut <= 0 {
-			return ""
-		}
-		out := scrubPublicInternalMarkers(f.pending[:cut])
+		f.pending += fragment
+		cut := utf8SafeCut(f.pending)
+		out := f.pending[:cut]
 		f.pending = f.pending[cut:]
-		return stripReplacementChars(out)
+		f.citePending += stripReplacementChars(out)
+		cleaned, rest := stripCitationMarkersStream(f.citePending)
+		f.citePending = rest
+		return cleaned
 	}
+	f.pending += fragment
 	return f.consume(false)
 }
 
@@ -531,9 +522,11 @@ func (f *publicIdentityStreamFilter) Flush() string {
 		return ""
 	}
 	if !publicIdentityPolicyEnabled() {
-		out := stripReplacementChars(scrubPublicInternalMarkers(f.pending))
+		out := stripReplacementChars(f.pending)
 		f.pending = ""
-		return out
+		cleaned, _ := stripCitationMarkersStream(f.citePending + out)
+		f.citePending = ""
+		return cleaned
 	}
 	out := f.consume(true)
 	f.pending = ""
@@ -565,11 +558,12 @@ func (f *publicIdentityStreamFilter) consume(final bool) string {
 	}
 	out := f.pending[:cut]
 	f.pending = f.pending[cut:]
-	return out
+	return stripReplacementChars(out)
 }
 
 type publicReasoningStreamFilter struct {
-	pending string
+	pending     string
+	citePending string
 }
 
 func newPublicReasoningStreamFilter() *publicReasoningStreamFilter {
@@ -585,7 +579,10 @@ func (f *publicReasoningStreamFilter) Push(fragment string) string {
 		cut := utf8SafeCut(f.pending)
 		out := f.pending[:cut]
 		f.pending = f.pending[cut:]
-		return stripReplacementChars(out)
+		f.citePending += stripReplacementChars(out)
+		cleaned, rest := stripCitationMarkersStream(f.citePending)
+		f.citePending = rest
+		return cleaned
 	}
 	f.pending += fragment
 	return f.consume(false)
@@ -598,7 +595,9 @@ func (f *publicReasoningStreamFilter) Flush() string {
 	if !publicIdentityPolicyEnabled() {
 		out := stripReplacementChars(f.pending)
 		f.pending = ""
-		return out
+		cleaned, _ := stripCitationMarkersStream(f.citePending + out)
+		f.citePending = ""
+		return cleaned
 	}
 	out := sanitizePublicReasoningText(f.pending)
 	f.pending = ""
@@ -615,8 +614,12 @@ func (f *publicReasoningStreamFilter) consume(final bool) string {
 		return sanitizePublicReasoningText(chunk)
 	}
 	if len(f.pending) > 4096 {
-		chunk := f.pending[:len(f.pending)-256]
-		f.pending = f.pending[len(f.pending)-256:]
+		cut := len(f.pending) - 256
+		for cut > 0 && !utf8.RuneStart(f.pending[cut]) {
+			cut--
+		}
+		chunk := f.pending[:cut]
+		f.pending = f.pending[cut:]
 		return sanitizePublicReasoningText(chunk)
 	}
 	return ""

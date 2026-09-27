@@ -131,7 +131,7 @@ func (c *M365CloudClient) doAPI(action string, payload map[string]any) (map[stri
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0")
+	req.Header.Set("User-Agent", chromeUA)
 	req.Header.Set("Origin", "https://m365.cloud.microsoft")
 	req.Header.Set("Referer", "https://m365.cloud.microsoft/")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")

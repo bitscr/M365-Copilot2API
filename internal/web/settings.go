@@ -22,11 +22,7 @@ type modelMapping struct {
 	DefaultReasoningLevel string `json:"defaultReasoningLevel"`
 }
 
-var defaultModelMappings = []modelMapping{
-	{PublicModel: "gpt-5.6-sol", UpstreamTone: "Gpt_5_6_Reasoning", DisplayName: "GPT-5.6-Sol", DefaultReasoningLevel: "low"},
-	{PublicModel: "gpt-5.6-terra", UpstreamTone: "Gpt_5_6_Reasoning", DisplayName: "GPT-5.6-Terra", DefaultReasoningLevel: "medium"},
-	{PublicModel: "gpt-5.6-luna", UpstreamTone: "Gpt_5_6_Reasoning", DisplayName: "GPT-5.6-Luna", DefaultReasoningLevel: "medium"},
-}
+var defaultModelMappings = []modelMapping{}
 
 var publicModelID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
 
@@ -35,46 +31,49 @@ var configurableCodexModels = []string{
 	"gpt-5.4",
 	"gpt-5.4-mini",
 	"gpt-5.5",
-	"gpt-5.6-sol",
-	"gpt-5.6-terra",
-	"gpt-5.6-luna",
+	"gpt-5.6-reasoning",
+	"flux-3",
+	"flux-4",
 	"codex-auto-review",
 }
 
 type runtimeSettings struct {
-	MaxToolCallsPerTurn        int            `json:"maxToolCallsPerTurn"`
-	MaxToolRounds              int            `json:"maxToolRounds"`
-	ContextWindow              int            `json:"contextWindow"`
-	MaxOutputTokens            int            `json:"maxOutputTokens"`
-	ChatTimeoutSeconds         int            `json:"chatTimeoutSeconds"`
-	ImageTimeoutSeconds        int            `json:"imageTimeoutSeconds"`
-	LogLevel                   string         `json:"logLevel"`
-	DebugLogPath               string         `json:"debugLogPath"`
-	ListenAddress              string         `json:"listenAddress"`
-	ConfigPath                 string         `json:"configPath"`
-	TokenCachePath             string         `json:"tokenCachePath"`
-	SessionCachePath           string         `json:"sessionCachePath"`
-	OutboundProxy              string         `json:"outboundProxy"`
-	ProxyPool                  []string       `json:"proxyPool,omitempty"`
-	ClientID                   string         `json:"clientId"`
-	Authority                  string         `json:"authority"`
-	RedirectURI                string         `json:"redirectUri"`
-	Scope                      string         `json:"scope"`
-	ModelMappings              []modelMapping `json:"modelMappings"`
-	ToolPlanningMode           string         `json:"toolPlanningMode"`
-	RateLimitCooldownSeconds   int            `json:"rateLimitCooldownSeconds"`
-	Scenario                   string         `json:"scenario"`
-	MaxConversationMessages    int            `json:"maxConversationMessages"`
-	LicenseType                string         `json:"licenseType"`
-	AccountConcurrencyLimit    int            `json:"accountConcurrencyLimit"`
-	EnableMemoryV2             bool           `json:"enableMemoryV2"`
-	EnableDeepWork             bool           `json:"enableDeepWork"`
-	EnableComputerUse          bool           `json:"enableComputerUse"`
-	EnableRealtimeVoice        bool           `json:"enableRealtimeVoice"`
-	EnableSystemPromptOverride bool           `json:"enableSystemPromptOverride"`
-	EnableDesignerImageGen4o   bool           `json:"enableDesignerImageGen4o"`
-	EnableCodeCanvas           bool           `json:"enableCodeCanvas"`
-	EnableSydneyReconnect      bool           `json:"enableSydneyReconnect"`
+	MaxToolCallsPerTurn               int            `json:"maxToolCallsPerTurn"`
+	MaxToolRounds                     int            `json:"maxToolRounds"`
+	ContextWindow                     int            `json:"contextWindow"`
+	MaxOutputTokens                   int            `json:"maxOutputTokens"`
+	ChatTimeoutSeconds                int            `json:"chatTimeoutSeconds"`
+	FirstTokenTimeoutSeconds          int            `json:"firstTokenTimeoutSeconds"`
+	ImageTimeoutSeconds               int            `json:"imageTimeoutSeconds"`
+	LogLevel                          string         `json:"logLevel"`
+	DebugLogPath                      string         `json:"debugLogPath"`
+	ListenAddress                     string         `json:"listenAddress"`
+	ConfigPath                        string         `json:"configPath"`
+	TokenCachePath                    string         `json:"tokenCachePath"`
+	SessionCachePath                  string         `json:"sessionCachePath"`
+	OutboundProxy                     string         `json:"outboundProxy"`
+	ProxyPool                         []string       `json:"proxyPool,omitempty"`
+	ClientID                          string         `json:"clientId"`
+	Authority                         string         `json:"authority"`
+	RedirectURI                       string         `json:"redirectUri"`
+	Scope                             string         `json:"scope"`
+	ModelMappings                     []modelMapping `json:"modelMappings"`
+	ToolPlanningMode                  string         `json:"toolPlanningMode"`
+	RateLimitCooldownSeconds          int            `json:"rateLimitCooldownSeconds"`
+	TransientThrottledCooldownSeconds int            `json:"transientThrottledCooldownSeconds"`
+	Scenario                          string         `json:"scenario"`
+	MaxConversationMessages           int            `json:"maxConversationMessages"`
+	LicenseType                       string         `json:"licenseType"`
+	AccountConcurrencyLimit           int            `json:"accountConcurrencyLimit"`
+	EnableMemoryV2                    bool           `json:"enableMemoryV2"`
+	EnableDeepWork                    bool           `json:"enableDeepWork"`
+	EnableComputerUse                 bool           `json:"enableComputerUse"`
+	EnableRealtimeVoice               bool           `json:"enableRealtimeVoice"`
+	EnableSystemPromptOverride        bool           `json:"enableSystemPromptOverride"`
+	EnableDesignerImageGen4o          bool           `json:"enableDesignerImageGen4o"`
+	EnableCodeCanvas                  bool           `json:"enableCodeCanvas"`
+	EnableSydneyReconnect             bool           `json:"enableSydneyReconnect"`
+	AutoStart                         bool           `json:"autoStart"`
 }
 
 type settingsStore struct {
@@ -94,25 +93,26 @@ func defaultRuntimeSettings() runtimeSettings {
 	return runtimeSettings{
 		MaxToolCallsPerTurn: envInt("M365_MAX_TOOL_CALLS_PER_TURN", 32), MaxToolRounds: envInt("M365_MAX_TOOL_ROUNDS", 512),
 		ContextWindow: envInt("M365_CONTEXT_WINDOW", 128000), MaxOutputTokens: envInt("M365_MAX_OUTPUT_TOKENS", 16384),
-		ChatTimeoutSeconds: envInt("M365_CHAT_TIMEOUT_SECONDS", 120), ImageTimeoutSeconds: envInt("M365_IMAGE_TIMEOUT_SECONDS", 150), LogLevel: firstNonEmptySetting(os.Getenv("M365_LOG_LEVEL"), "info"),
+		ChatTimeoutSeconds: envInt("M365_CHAT_TIMEOUT_SECONDS", 120), FirstTokenTimeoutSeconds: envInt("M365_FIRST_TOKEN_TIMEOUT_SECONDS", 75), ImageTimeoutSeconds: envInt("M365_IMAGE_TIMEOUT_SECONDS", 150), LogLevel: firstNonEmptySetting(os.Getenv("M365_LOG_LEVEL"), "info"),
 		DebugLogPath: os.Getenv("M365_DEBUG_LOG"), ListenAddress: os.Getenv("M365_LISTEN"), ConfigPath: os.Getenv("M365_CONFIG"),
 		TokenCachePath: os.Getenv("M365_TOKEN_CACHE"), SessionCachePath: os.Getenv("M365_SESSION_CACHE"), OutboundProxy: os.Getenv(outbound.EnvProxy), ClientID: os.Getenv("M365_CLIENT_ID"),
 		Authority: os.Getenv("M365_AUTHORITY"), RedirectURI: os.Getenv("M365_REDIRECT_URI"), Scope: os.Getenv("M365_SCOPE"),
-		ModelMappings:              append([]modelMapping(nil), defaultModelMappings...),
-		ToolPlanningMode:           toolPlanningMode(os.Getenv("M365_TOOL_PLANNING_MODE")),
-		RateLimitCooldownSeconds:   envInt("M365_RATE_LIMIT_COOLDOWN_SECONDS", 30),
-		Scenario:                   firstNonEmptySetting(os.Getenv("M365_SCENARIO"), "OfficeWebIncludedCopilot"),
-		MaxConversationMessages:    envInt("M365_MAX_CONVERSATION_MESSAGES", 600),
-		LicenseType:                firstNonEmptySetting(os.Getenv("M365_LICENSE_TYPE"), "Starter"),
-		AccountConcurrencyLimit:    envInt("M365_ACCOUNT_CONCURRENCY_LIMIT", 8),
-		EnableMemoryV2:             os.Getenv("M365_ENABLE_MEMORY_V2") == "true",
-		EnableDeepWork:             os.Getenv("M365_ENABLE_DEEP_WORK") == "true",
-		EnableComputerUse:          os.Getenv("M365_ENABLE_COMPUTER_USE") == "true",
-		EnableRealtimeVoice:        os.Getenv("M365_ENABLE_REALTIME_VOICE") == "true",
-		EnableSystemPromptOverride: os.Getenv("M365_ENABLE_SYSTEM_PROMPT_OVERRIDE") == "true",
-		EnableDesignerImageGen4o:   os.Getenv("M365_ENABLE_DESIGNER_IMAGE_GEN_4O") == "true",
-		EnableCodeCanvas:           os.Getenv("M365_ENABLE_CODE_CANVAS") == "true",
-		EnableSydneyReconnect:      os.Getenv("M365_ENABLE_SYDNEY_RECONNECT") == "true",
+		ModelMappings:                     append([]modelMapping(nil), defaultModelMappings...),
+		ToolPlanningMode:                  toolPlanningMode(os.Getenv("M365_TOOL_PLANNING_MODE")),
+		RateLimitCooldownSeconds:          envInt("M365_RATE_LIMIT_COOLDOWN_SECONDS", 30),
+		TransientThrottledCooldownSeconds: envInt("M365_TRANSIENT_THROTTLED_COOLDOWN_SECONDS", 15),
+		Scenario:                          firstNonEmptySetting(os.Getenv("M365_SCENARIO"), "OfficeWebIncludedCopilot"),
+		MaxConversationMessages:           envInt("M365_MAX_CONVERSATION_MESSAGES", 600),
+		LicenseType:                       firstNonEmptySetting(os.Getenv("M365_LICENSE_TYPE"), "Starter"),
+		AccountConcurrencyLimit:           envInt("M365_ACCOUNT_CONCURRENCY_LIMIT", 8),
+		EnableMemoryV2:                    os.Getenv("M365_ENABLE_MEMORY_V2") == "true",
+		EnableDeepWork:                    os.Getenv("M365_ENABLE_DEEP_WORK") == "true",
+		EnableComputerUse:                 os.Getenv("M365_ENABLE_COMPUTER_USE") == "true",
+		EnableRealtimeVoice:               os.Getenv("M365_ENABLE_REALTIME_VOICE") == "true",
+		EnableSystemPromptOverride:        os.Getenv("M365_ENABLE_SYSTEM_PROMPT_OVERRIDE") == "true",
+		EnableDesignerImageGen4o:          os.Getenv("M365_ENABLE_DESIGNER_IMAGE_GEN_4O") == "true",
+		EnableCodeCanvas:                  os.Getenv("M365_ENABLE_CODE_CANVAS") == "true",
+		EnableSydneyReconnect:             os.Getenv("M365_ENABLE_SYDNEY_RECONNECT") == "true",
 	}
 }
 func settingsPath() string {
@@ -162,6 +162,9 @@ func validateSettings(v runtimeSettings) error {
 	if v.ChatTimeoutSeconds < 5 || v.ChatTimeoutSeconds > 3600 {
 		return fmt.Errorf("聊天超时必须为 5-3600 秒")
 	}
+	if v.FirstTokenTimeoutSeconds < 15 || v.FirstTokenTimeoutSeconds > 600 {
+		return fmt.Errorf("首字超时必须为 15-600 秒")
+	}
 	if v.ImageTimeoutSeconds < 5 || v.ImageTimeoutSeconds > 3600 {
 		return fmt.Errorf("图片超时必须为 5-3600 秒")
 	}
@@ -199,6 +202,9 @@ func validateSettings(v runtimeSettings) error {
 	}
 	if v.RateLimitCooldownSeconds < 5 || v.RateLimitCooldownSeconds > 3600 {
 		return fmt.Errorf("限流冷却时间必须为 5-3600 秒")
+	}
+	if v.TransientThrottledCooldownSeconds < 5 || v.TransientThrottledCooldownSeconds > 600 {
+		return fmt.Errorf("瞬时限流冷却时间必须为 5-600 秒")
 	}
 	if v.MaxConversationMessages < 1 || v.MaxConversationMessages > 10000 {
 		return fmt.Errorf("对话消息上限必须为 1-10000")
@@ -239,7 +245,7 @@ func (s *settingsStore) save(v runtimeSettings) error {
 func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		jsonOut(w, map[string]any{"settings": s.settings.get(), "codexModels": configurableCodexModels, "upstreamTones": knownUpstreamTones(), "restartRequiredFields": restartRequiredFields, "restartStrategy": RestartStrategy()})
+		jsonOut(w, map[string]any{"settings": s.settings.get(), "codexModels": configurableCodexModels, "upstreamTones": knownUpstreamTones(), "autoStartSupported": autoStartSupported(), "autoStart": autoStartEnabled(), "restartRequiredFields": []string{"listenAddress", "configPath", "tokenCachePath", "sessionCachePath", "outboundProxy", "proxyPool", "clientId", "authority", "redirectUri", "scope", "debugLogPath"}})
 	case http.MethodPut:
 		// 前端可能只修改一个字段（如监听地址），其余字段以零值提交。
 		// 逐字段合并到当前设置再校验，避免"改一个字段弄丢其他配置"。
@@ -255,6 +261,10 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, 400, "invalid_request_error", "bad json")
 			return
 		}
+		// Auto-start is a machine-level toggle, not a persisted runtime
+		// setting; apply it directly and strip it from the settings payload.
+		autoStartRequested, hasAutoStart := patch["autoStart"].(bool)
+		delete(patch, "autoStart")
 		for k, v := range patch {
 			merged[k] = v
 		}
@@ -272,7 +282,16 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, 400, "invalid_request_error", e.Error())
 			return
 		}
-		jsonOut(w, map[string]any{"ok": true, "settings": v})
+		autoStartApplied := false
+		var autoStartErr string
+		if hasAutoStart && autoStartSupported() {
+			if e := setAutoStart(autoStartRequested); e != nil {
+				autoStartErr = e.Error()
+			} else {
+				autoStartApplied = autoStartRequested
+			}
+		}
+		jsonOut(w, map[string]any{"ok": true, "settings": v, "autoStart": autoStartEnabled(), "autoStartApplied": autoStartApplied, "autoStartError": autoStartErr})
 	default:
 		writeOpenAIError(w, 405, "invalid_request_error", "method not allowed")
 	}
@@ -333,43 +352,15 @@ func limitToolCalls(c []detectedToolCall, n int) []detectedToolCall {
 
 func currentSettings() runtimeSettings { return openSettingsStore().get() }
 
-// startupSettingsEnvValues maps persisted settings to the environment variable
-// names they bootstrap.
-func startupSettingsEnvValues(s runtimeSettings) map[string]string {
-	return map[string]string{"M365_LISTEN": s.ListenAddress, "M365_CONFIG": s.ConfigPath, "M365_TOKEN_CACHE": s.TokenCachePath, "M365_SESSION_CACHE": s.SessionCachePath, outbound.EnvProxy: s.OutboundProxy, "M365_PROXY_POOL": strings.Join(s.ProxyPool, "\n"), "M365_CLIENT_ID": s.ClientID, "M365_AUTHORITY": s.Authority, "M365_REDIRECT_URI": s.RedirectURI, "M365_SCOPE": s.Scope, "M365_DEBUG_LOG": s.DebugLogPath}
-}
-
-// applyStartupSettings is the pure precedence core of ApplyStartupSettingsEnv,
-// extracted so it can be tested without the process-global settings store.
-// When envWins is false (the default), a non-empty saved value overwrites the
-// environment; when true, an existing environment variable is left untouched.
-func applyStartupSettings(s runtimeSettings, envWins bool, lookup func(string) (string, bool), set func(string, string) error) {
-	for k, v := range startupSettingsEnvValues(s) {
-		if strings.TrimSpace(v) == "" {
-			continue
-		}
-		if envWins {
-			if _, exists := lookup(k); exists {
-				continue
-			}
-		}
-		_ = set(k, v)
-	}
-}
-
 // ApplyStartupSettingsEnv loads persisted restart-required fields before the
-// rest of the application initializes. Values saved from the web console win
-// over the process environment, because a value can only reach the store by an
-// explicit admin action in the console; the environment is merely a bootstrap
-// default. This is what makes "change the listen port in the console, restart"
-// actually take effect even when M365_LISTEN (or a sibling field) is pinned in
-// an EnvironmentFile / docker-compose / systemd unit.
-//
-// A field with an empty saved value does NOT override the environment, so a
-// deployment that only configures things via env keeps working unchanged.
-// Set M365_SETTINGS_ENV_WINS=true to restore the legacy env-overrides-console
-// behavior (e.g. to hard-pin the bind address on a shared host).
+// rest of the application initializes. Explicit process environment variables
+// always win over values saved from the web console.
 func ApplyStartupSettingsEnv() {
-	envWins := strings.EqualFold(strings.TrimSpace(os.Getenv("M365_SETTINGS_ENV_WINS")), "true")
-	applyStartupSettings(openSettingsStore().get(), envWins, os.LookupEnv, os.Setenv)
+	s := openSettingsStore().get()
+	values := map[string]string{"M365_LISTEN": s.ListenAddress, "M365_CONFIG": s.ConfigPath, "M365_TOKEN_CACHE": s.TokenCachePath, "M365_SESSION_CACHE": s.SessionCachePath, outbound.EnvProxy: s.OutboundProxy, "M365_PROXY_POOL": strings.Join(s.ProxyPool, "\n"), "M365_CLIENT_ID": s.ClientID, "M365_AUTHORITY": s.Authority, "M365_REDIRECT_URI": s.RedirectURI, "M365_SCOPE": s.Scope, "M365_DEBUG_LOG": s.DebugLogPath}
+	for k, v := range values {
+		if _, exists := os.LookupEnv(k); !exists && strings.TrimSpace(v) != "" {
+			_ = os.Setenv(k, v)
+		}
+	}
 }
