@@ -240,6 +240,7 @@ func scrubPublicInternalMarkers(text string) string {
 }
 
 func sanitizePublicAssistantTextForModel(text, model string) string {
+	text = stripReplacementChars(text)
 	text = scrubPublicInternalMarkers(text)
 	if !publicIdentityPolicyEnabled() {
 		return text
@@ -249,13 +250,66 @@ func sanitizePublicAssistantTextForModel(text, model string) string {
 }
 
 func sanitizePublicInternalText(text string) string {
+	text = stripReplacementChars(text)
 	if !publicIdentityPolicyEnabled() {
 		return text
 	}
 	return publicProviderIdentityPattern.ReplaceAllString(text, publicAssistantIdentity)
 }
 
+// stripReplacementChars removes U+FFFD replacement characters produced by
+// upstream byte-level truncation. It always applies, independent of the
+// opt-in identity policy, because U+FFFD is never legitimate content.
+//
+// IndexRune treats both a literal U+FFFD and any invalid UTF-8 byte as
+// RuneError, but ReplaceAll only removes the encoded U+FFFD sequence. A rune
+// split across upstream fragments leaves raw invalid bytes behind, and
+// encoding/json would then re-introduce U+FFFD when it marshals the value for
+// the client. ToValidUTF8 drops those leftover bytes so the client never sees
+// a replacement character.
+func stripReplacementChars(text string) string {
+	if text == "" || strings.IndexRune(text, utf8.RuneError) < 0 {
+		return text
+	}
+	text = strings.ReplaceAll(text, string(utf8.RuneError), "")
+	if utf8.ValidString(text) {
+		return text
+	}
+	return strings.ToValidUTF8(text, "")
+}
+
+// utf8SafeCut returns the byte length of the longest prefix of s that ends on a
+// complete UTF-8 sequence boundary. An incomplete trailing sequence is held
+// back so a rune split across upstream fragments is reassembled on the next
+// fragment instead of being dropped or turned into U+FFFD.
+func utf8SafeCut(s string) int {
+	n := len(s)
+	for i := 1; i <= 3 && i <= n; i++ {
+		c := s[n-i]
+		if c < 0x80 {
+			return n
+		}
+		if c&0xC0 != 0x80 {
+			size := 1
+			switch {
+			case c&0xF8 == 0xF0:
+				size = 4
+			case c&0xF0 == 0xE0:
+				size = 3
+			case c&0xE0 == 0xC0:
+				size = 2
+			}
+			if i == size {
+				return n
+			}
+			return n - i
+		}
+	}
+	return n
+}
+
 func sanitizePublicReasoningText(text string) string {
+	text = stripReplacementChars(text)
 	if !publicIdentityPolicyEnabled() {
 		return text
 	}
@@ -273,6 +327,7 @@ func sanitizePublicAssistantTextWithStateForModel(text string, identityWritten *
 	if text == "" {
 		return ""
 	}
+	text = stripReplacementChars(text)
 	text = publicInternalCitationPattern.ReplaceAllString(text, "")
 	var out strings.Builder
 	written := identityWritten != nil && *identityWritten
@@ -466,7 +521,7 @@ func (f *publicIdentityStreamFilter) Push(fragment string) string {
 		}
 		out := scrubPublicInternalMarkers(f.pending[:cut])
 		f.pending = f.pending[cut:]
-		return out
+		return stripReplacementChars(out)
 	}
 	return f.consume(false)
 }
@@ -476,7 +531,7 @@ func (f *publicIdentityStreamFilter) Flush() string {
 		return ""
 	}
 	if !publicIdentityPolicyEnabled() {
-		out := scrubPublicInternalMarkers(f.pending)
+		out := stripReplacementChars(scrubPublicInternalMarkers(f.pending))
 		f.pending = ""
 		return out
 	}
@@ -526,7 +581,11 @@ func (f *publicReasoningStreamFilter) Push(fragment string) string {
 		return sanitizePublicReasoningText(fragment)
 	}
 	if !publicIdentityPolicyEnabled() {
-		return fragment
+		f.pending += fragment
+		cut := utf8SafeCut(f.pending)
+		out := f.pending[:cut]
+		f.pending = f.pending[cut:]
+		return stripReplacementChars(out)
 	}
 	f.pending += fragment
 	return f.consume(false)
@@ -537,7 +596,7 @@ func (f *publicReasoningStreamFilter) Flush() string {
 		return ""
 	}
 	if !publicIdentityPolicyEnabled() {
-		out := f.pending
+		out := stripReplacementChars(f.pending)
 		f.pending = ""
 		return out
 	}

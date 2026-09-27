@@ -2321,8 +2321,19 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// are held until either a sandbox/refusal signature matches (abort the
 		// stream and re-ask corrected) or a flush threshold is crossed (normal
 		// answer, keep streaming).
+		// Execution-boundary sliding window. When tools are declared, upstream
+		// text that claims container/sandbox execution (see
+		// sandboxHallucinationPatterns) must never reach the caller: the
+		// upstream model lives in its own cloud container and reports the
+		// caller's files as missing from there. A fixed hold-till-threshold
+		// buffer was WRONG: short legitimate answers (<512B) never crossed the
+		// threshold and vanished at stream end, the client saw an empty 200
+		// and retried 3x then reported "No reply". Instead slide a fixed tail
+		// window: text flows through continuously, only the trailing
+		// windowTail bytes are retained for cross-fragment scan; anything
+		// shorter than the window is emitted in full at stream end.
 		holdActive := len(toolMaps) > 0 || executionIntent(prompt)
-		const holdLimit = 4000
+		const windowTail = 512
 		var held string
 		ejected := false
 		res, err := s.chatWithAccountEvents(ctx, acc.ID, account, answerReq, func(ev chathub.StreamEvent) error {
@@ -2354,9 +2365,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					holdActive = false
 					return errSandboxEject
 				}
-				if len(held) >= holdLimit || (len(held) >= 512 && strings.ContainsAny(held, "。.!?\n")) {
-					holdActive = false
-					return emitText(held)
+				// Stream through: emit everything beyond the sliding tail
+				// window. Short answers stay fully held and are flushed at
+				// stream end — never dropped.
+				excess := len(held) - windowTail
+				if excess > 0 {
+					out := held[:excess]
+					held = held[excess:]
+					return emitText(out)
 				}
 				return nil
 			}
@@ -2577,6 +2593,31 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			// The stream may have carried preamble text before the tool call;
 			// release its held-back tail so the client sees the full preamble.
 			_ = flushText()
+			if holdActive && held != "" {
+				if isBareNoToolNeeded(held) {
+					// Bare NO_TOOL_NEEDED must not reach the client as answer
+					// text — normalize to empty so Hermes injects its retry
+					// turn and forces a real summary (mirrors the non-stream
+					// isBareNoToolNeeded path at answer assembly).
+					log.Printf("[answer-empty] id=%s stream held bare NO_TOOL_NEEDED, dropping to trigger client retry", requestID)
+					holdActive = false
+					_ = flushText()
+				} else {
+					// Sliding-window tail flush: preamble text that still sits
+					// in the trailing window must reach the client before the
+					// tool-call frame.
+					holdActive = false
+					if err := emitText(held); err != nil {
+						return
+					}
+					// emitText pushes through identityFilter, which holds back
+					// its own ~64-byte tail — release it or the last characters
+					// are lost.
+					if err := flushText(); err != nil {
+						return
+					}
+				}
+			}
 			log.Printf("[req-trace] id=%s stage=tool_calls_detected count=%d names=%v", requestID, len(calls), func() []string {
 				var n []string
 				for _, c := range calls {
@@ -2606,6 +2647,28 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// Release the filter's held-back tail before the terminal frames so the
 		// last characters of the answer are not dropped.
 		_ = flushText()
+		if holdActive && held != "" {
+			if isBareNoToolNeeded(held) {
+				// Bare NO_TOOL_NEEDED never reaches the client as answer text
+				// — normalize to empty so Hermes injects its retry turn and
+				// forces a real summary (mirrors the non-stream path).
+				log.Printf("[answer-empty] id=%s stream end bare NO_TOOL_NEEDED, dropping to trigger client retry", requestID)
+				holdActive = false
+			} else {
+				// End-of-stream flush for the sliding window: short answers that
+				// never exceeded the tail window must still reach the client.
+				holdActive = false
+				if err := emitText(held); err != nil {
+					return
+				}
+				// emitText pushes through identityFilter, which holds back its
+				// own ~64-byte tail — without this second flush the last
+				// characters vanish (observed: "游戏内是否" cut mid-sentence).
+				if err := flushText(); err != nil {
+					return
+				}
+			}
+		}
 		_ = sw.data(mustJSON(finishChunk))
 		_ = sw.data("[DONE]")
 		if res.Timestamps.RequestSent != "" {
@@ -2837,7 +2900,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}()
 		streamedReasoningLen := 0
 		holdActiveB := len(toolMaps) > 0 || executionIntent(prompt)
-		const holdLimitB = 4000
+		// Sliding tail window, same rationale as the tool streaming path: any
+		// content short enough to fit the window is emitted in full at stream
+		// end, never dropped. No length threshold gates legitimate answers.
+		const windowTailB = 512
 		var heldB string
 		ejectedB := false
 		onDeltaWrapped := func(content string) error {
@@ -2851,9 +2917,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					holdActiveB = false
 					return errSandboxEject
 				}
-				if len(heldB) >= holdLimitB || (len(heldB) >= 256 && strings.ContainsAny(heldB, "。.!?\n")) || len(heldB) >= 384 {
-					holdActiveB = false
-					return onDelta(heldB)
+				excessB := len(heldB) - windowTailB
+				if excessB > 0 {
+					outB := heldB[:excessB]
+					heldB = heldB[excessB:]
+					return onDelta(outB)
 				}
 				return nil
 			}
@@ -2947,18 +3015,28 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 		if err == nil {
 			if holdActiveB && heldB != "" {
-				// End-of-stream flush: content that never crossed the eject
-				// threshold (short, sentence-less replies) was accumulating in
-				// heldB. Without this, ≤384-char answers vanished with the
-				// stream — the client saw an empty 200 and retried 3x then
-				// reported "No reply" while the gateway had the full answer.
-				holdActiveB = false
-				if writeErr := onDelta(heldB); writeErr != nil {
-					return
+				if isBareNoToolNeeded(heldB) {
+					// Bare NO_TOOL_NEEDED never reaches the client as answer
+					// text — normalize to empty so Hermes injects its retry
+					// turn and forces a real summary.
+					log.Printf("[answer-empty] id=%s streamB held bare NO_TOOL_NEEDED, dropping to trigger client retry", requestID)
+					holdActiveB = false
+				} else {
+					// End-of-stream flush: content that never crossed the eject
+					// threshold (short, sentence-less replies) was accumulating in
+					// heldB. Without this, ≤384-char answers vanished with the
+					// stream — the client saw an empty 200 and retried 3x then
+					// reported "No reply" while the gateway had the full answer.
+					holdActiveB = false
+					if writeErr := onDelta(heldB); writeErr != nil {
+						return
+					}
 				}
 			}
 			if content := contentFilter.Flush(); content != "" {
-				if writeErr := writeChunk(map[string]any{"content": content}); writeErr != nil {
+				if isBareNoToolNeeded(content) {
+					log.Printf("[answer-empty] id=%s streamB filter bare NO_TOOL_NEEDED, dropping to trigger client retry", requestID)
+				} else if writeErr := writeChunk(map[string]any{"content": content}); writeErr != nil {
 					return
 				}
 			}
