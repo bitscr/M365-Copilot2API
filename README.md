@@ -35,12 +35,12 @@
 | `M365_TRUSTED_PROXIES` | CF 前置**必配** | `cloudflare` 或逗号分隔 CIDR 列表;只信任这些来源的 `X-Forwarded-For` |
 | `M365_FINGERPRINT_MODE` | CF 前置**必配** | `ua`(推荐,CF 后稳定)/ `ip_ua`(默认)/ `off` |
 | `M365_TOOL_PLANNING_MODE` | 否 | `router`(默认,推荐)/ `native`(上游透传,不推荐) |
-| `M365_CONTEXT_WINDOW` | 否 | 上下文窗口。**建议 `60000`**:上游 M365 在设置默认值 128000 之前就已退化(空回复/"No reply") |
-| `M365_MAX_OUTPUT_TOKENS` | 否 | 最大输出 token(建议 `4096` 与上述窗口搭配) |
+| `M365_CONTEXT_WINDOW` | 否 | 上下文窗口。**建议 `200000`**:实测上游 M365 的 1M 窗口真实可用,200K 下无退化 |
+| `M365_MAX_OUTPUT_TOKENS` | 否 | 最大输出 token(**建议 `8192`**,与上述窗口搭配) |
 | `M365_AUTO_CLEANUP_*` | 否 | 云对话自动清理:闲置窗口与数量上限 |
 | `M365_OUTBOUND_PROXY` / `M365_PROXY_POOL` | 否 | 上游调用走代理(WARP/SOCKS/HTTP) |
 
-**注意**:启动时 `<M365_DATA_DIR>/settings.json` 中的持久化设置会**覆盖**环境变量。要让环境变量反向压过控制台设置,设 `M365_SETTINGS_ENV_WINS=true`(默认不要设)。
+**注意**:启动时 `<M365_DATA_DIR>/settings.json` 中的持久化设置会**覆盖**环境变量。控制台里修改的设置会立即持久化到该文件,大多数运行参数(上下文窗口、输出上限、规划模式等)保存后即刻生效;监听地址、数据路径、凭据类字段需重启服务。
 
 ---
 
@@ -145,4 +145,4 @@ Windows 用户直接运行 `m365-copilot2api-windows-amd64.exe` 即可(控制台
 
 ## License
 
-[MIT](LICENSE)
+[AGPL-3.0 + Additional Terms](LICENSE)
