@@ -194,6 +194,42 @@ func TestBatchAccountsAppliesAtomically(t *testing.T) {
 	}
 }
 
+func TestBatchAccountsDeleteRemovesSelected(t *testing.T) {
+	store := testAccountFiles(t)
+	s := &Server{tokens: store, accountPool: newAccountHealth()}
+	do := func(body string) (int, map[string]any) {
+		w := httptest.NewRecorder()
+		s.batchAccounts(w, httptest.NewRequest(http.MethodPost, "/api/accounts/batch", strings.NewReader(body)))
+		var out map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &out)
+		return w.Code, out
+	}
+	if code, _ := do(`{"ids":["u-1"],"delete":true,"scheduling":false}`); code != 400 {
+		t.Fatalf("delete mixed with updates status=%d want 400", code)
+	}
+	if _, ok := store.Get("u-1"); !ok {
+		t.Fatal("rejected request must not delete anything")
+	}
+	if code, _ := do(`{"ids":[],"delete":true}`); code != 400 {
+		t.Fatalf("empty ids status=%d want 400", code)
+	}
+	code, out := do(`{"ids":["u-1","missing","u-1","u-2"],"delete":true}`)
+	if code != 200 || out["status"] != "deleted" || out["deleted"] != float64(2) {
+		t.Fatalf("batch delete status=%d out=%v", code, out)
+	}
+	for _, id := range []string{"u-1", "u-2"} {
+		if _, ok := store.Get(id); ok {
+			t.Fatalf("account %s must be gone", id)
+		}
+	}
+	if _, ok := store.Get("u-3"); !ok {
+		t.Fatal("unselected account must survive")
+	}
+	if acc, _ := store.Get("u-3"); !store.ScheduleEnabled("u-3") || acc.SystemPrompt != "" {
+		t.Fatal("delete must not touch surviving accounts")
+	}
+}
+
 func TestWriteUpstreamErrorHeaders(t *testing.T) {
 	w := httptest.NewRecorder()
 	writeUpstreamError(w, &UpstreamHTTPError{Status: 429, RetryAfter: 90})

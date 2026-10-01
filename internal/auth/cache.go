@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	mrand "math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,33 +21,68 @@ import (
 )
 
 type AccountToken struct {
-	ID                string    `json:"id"`
-	Email             string    `json:"email"`
-	DisplayName       string    `json:"displayName,omitempty"`
-	Status            string    `json:"status"`
-	ScheduleDisabled  bool      `json:"scheduleDisabled,omitempty"`
-	WebSearchDisabled bool      `json:"webSearchDisabled,omitempty"`
-	SystemPrompt      string    `json:"systemPrompt,omitempty"`
-	AccessToken       string    `json:"accessToken"`
-	RefreshToken      string    `json:"refreshToken,omitempty"`
-	ExpiresAt         time.Time `json:"expiresAt"`
-	UpdatedAt         time.Time `json:"updatedAt"`
-	OID               string    `json:"oid,omitempty"`
-	TID               string    `json:"tid,omitempty"`
-	ClientID          string    `json:"clientId,omitempty"`
-	BoundProxy        string    `json:"boundProxy,omitempty"`
+	ID               string `json:"id"`
+	Email            string `json:"email"`
+	DisplayName      string `json:"displayName,omitempty"`
+	Status           string `json:"status"`
+	ScheduleDisabled bool   `json:"scheduleDisabled,omitempty"`
+	// ScheduleDisabledBy records WHO turned scheduling off: "user" for a console
+	// action, "auto" when the gateway pulled the account out of rotation after a
+	// failed token refresh. Only "auto" may be cleared automatically, so a
+	// deliberate user choice is never overridden. Empty means "unknown/user".
+	ScheduleDisabledBy string    `json:"scheduleDisabledBy,omitempty"`
+	WebSearchDisabled  bool      `json:"webSearchDisabled,omitempty"`
+	SystemPrompt       string    `json:"systemPrompt,omitempty"`
+	AccessToken        string    `json:"accessToken"`
+	RefreshToken       string    `json:"refreshToken,omitempty"`
+	ExpiresAt          time.Time `json:"expiresAt"`
+	UpdatedAt          time.Time `json:"updatedAt"`
+	OID                string    `json:"oid,omitempty"`
+	TID                string    `json:"tid,omitempty"`
+	ClientID           string    `json:"clientId,omitempty"`
+	BoundProxy         string    `json:"boundProxy,omitempty"`
 }
 
 type Cache struct {
 	Accounts []AccountToken `json:"accounts"`
 }
 
+// Reasons recorded in AccountToken.ScheduleDisabledBy.
+const (
+	ScheduleDisabledByUser = "user"
+	// ScheduleDisabledByAuto: the token could not be refreshed. Reversed by a
+	// successful refresh (see Upsert).
+	ScheduleDisabledByAuto = "auto"
+	// ScheduleDisabledByUpstream: the upstream accepted the connection but
+	// refused to serve the account (non-Success result frame). A token refresh
+	// cannot prove this is over, so ONLY a successful upstream probe reverses it.
+	ScheduleDisabledByUpstream = "auto-upstream"
+)
+
+// autoDisableExpiredFromEnv reports whether a failed token refresh should take
+// the account out of rotation. Default on; set M365_ACCOUNT_AUTO_DISABLE to a
+// falsey value to keep scheduling untouched and let the request path retry.
+func autoDisableExpiredFromEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("M365_ACCOUNT_AUTO_DISABLE"))) {
+	case "0", "false", "no", "off":
+		return false
+	}
+	return true
+}
+
 type Store struct {
-	mu       sync.Mutex
-	path     string
-	data     Cache
-	nextIdx  int
+	mu   sync.Mutex
+	path string
+	data Cache
+	// pick selects a starting offset in [0,n) for Next. It is injectable so
+	// tests can make account selection deterministic; when nil the global
+	// math/rand/v2 source is used (safe for concurrent use, seeded per
+	// process).
+	pick     func(n int) int
 	inflight map[string]*inflightRefresh
+	// autoDisableExpired takes an account out of rotation when its token can no
+	// longer be refreshed (see markExpiredLocked). Set from M365_ACCOUNT_AUTO_DISABLE.
+	autoDisableExpired bool
 }
 
 type inflightRefresh struct {
@@ -256,7 +292,7 @@ func OpenStore(path string) (*Store, error) {
 		path = CachePath()
 	}
 	cleanupStaleTmp(path)
-	s := &Store{path: path, data: Cache{Accounts: []AccountToken{}}}
+	s := &Store{path: path, data: Cache{Accounts: []AccountToken{}}, autoDisableExpired: autoDisableExpiredFromEnv()}
 	b, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return s, nil
@@ -327,6 +363,13 @@ func (s *Store) SetScheduleEnabled(id string, enabled bool) error {
 	for i := range s.data.Accounts {
 		if s.data.Accounts[i].ID == id {
 			s.data.Accounts[i].ScheduleDisabled = !enabled
+			// A console action is a user decision: it must never be undone by
+			// the automatic recovery path.
+			if enabled {
+				s.data.Accounts[i].ScheduleDisabledBy = ""
+			} else {
+				s.data.Accounts[i].ScheduleDisabledBy = ScheduleDisabledByUser
+			}
 			s.data.Accounts[i].UpdatedAt = time.Now()
 			return s.saveLocked()
 		}
@@ -381,6 +424,11 @@ func (s *Store) SetAccountsBatch(ids []string, schedule, webSearch *bool, system
 	for _, i := range idx {
 		if schedule != nil {
 			s.data.Accounts[i].ScheduleDisabled = !*schedule
+			if *schedule {
+				s.data.Accounts[i].ScheduleDisabledBy = ""
+			} else {
+				s.data.Accounts[i].ScheduleDisabledBy = ScheduleDisabledByUser
+			}
 		}
 		if webSearch != nil {
 			s.data.Accounts[i].WebSearchDisabled = !*webSearch
@@ -452,7 +500,14 @@ func (s *Store) Upsert(tok TokenSet) (AccountToken, error) {
 			if acc.OID == "" {
 				acc.OID = existing.OID
 			}
+			// A fresh token proves the CREDENTIALS work, not that the upstream
+			// will serve the account: bulk accounts refresh happily and still
+			// get refused with a non-Success result frame. Rotation is
+			// therefore restored ONLY by a successful REAL request
+			// (Server.recoverAccounts -> ReenableGatewayDisabled). Preserve the
+			// disable exactly as it stands.
 			acc.ScheduleDisabled = existing.ScheduleDisabled
+			acc.ScheduleDisabledBy = existing.ScheduleDisabledBy
 			acc.WebSearchDisabled = existing.WebSearchDisabled
 			if acc.SystemPrompt == "" {
 				acc.SystemPrompt = existing.SystemPrompt
@@ -471,6 +526,28 @@ func (s *Store) Upsert(tok TokenSet) (AccountToken, error) {
 	return acc, s.saveLocked()
 }
 
+// markExpiredLocked records that the account's token could not be refreshed.
+// When auto-disable is on it also takes the account out of rotation, tagging the
+// reason as "auto" so a later successful refresh can put it back. An account the
+// USER disabled stays tagged "user" and is left exactly as the user set it.
+func (s *Store) markExpiredLocked(i int) {
+	a := &s.data.Accounts[i]
+	a.Status = "expired"
+	a.UpdatedAt = time.Now()
+	if !s.autoDisableExpired {
+		return
+	}
+	// Only an account that is currently IN rotation gets auto-disabled. If it is
+	// already out, leave the reason exactly as it is: an empty reason means the
+	// disable predates this feature (or came from somewhere else) and must never
+	// be reversed automatically.
+	if a.ScheduleDisabled {
+		return
+	}
+	a.ScheduleDisabled = true
+	a.ScheduleDisabledBy = ScheduleDisabledByAuto
+}
+
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -482,6 +559,41 @@ func (s *Store) Delete(id string) error {
 	}
 	s.data.Accounts = next
 	return s.saveLocked()
+}
+
+// DeleteAccounts removes every listed account in ONE atomic write. Unknown or
+// duplicate IDs are ignored rather than aborting the batch: the caller asked
+// for those accounts to be gone, and a stale selection (e.g. the same account
+// deleted from another tab) must not block the accounts that do exist. The
+// return value is how many accounts were actually removed.
+func (s *Store) DeleteAccounts(ids []string) (int, error) {
+	drop := map[string]bool{}
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || drop[id] {
+			continue
+		}
+		drop[id] = true
+	}
+	if len(drop) == 0 {
+		return 0, errors.New("no account ids")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kept := s.data.Accounts[:0]
+	removed := 0
+	for _, a := range s.data.Accounts {
+		if drop[a.ID] {
+			removed++
+			continue
+		}
+		kept = append(kept, a)
+	}
+	s.data.Accounts = kept
+	if err := s.saveLocked(); err != nil {
+		return 0, err
+	}
+	return removed, nil
 }
 
 func (s *Store) SetBoundProxy(id, proxyURL string) error {
@@ -524,10 +636,20 @@ func (s *Store) Next() (AccountToken, bool) {
 	if n == 0 {
 		return AccountToken{}, false
 	}
+	// Order is deliberately not sequential. The old cursor lived in memory and
+	// reset to the head of accounts.json on every restart, so the first N
+	// requests after a deploy were served by the same handful of accounts
+	// while the tail sat idle. Drawing a random start offset removes that
+	// head bias while keeping the same eligibility rules: a disabled, expired
+	// or schedule-disabled account is still skipped, it is just not a
+	// candidate to be drawn in the first place.
+	pick := s.pick
+	if pick == nil {
+		pick = mrand.IntN
+	}
+	start := pick(n)
 	for i := 0; i < n; i++ {
-		idx := s.nextIdx % n
-		acc := s.data.Accounts[idx]
-		s.nextIdx = (idx + 1) % n
+		acc := s.data.Accounts[(start+i)%n]
 		if !acc.ScheduleDisabled && acc.Status != "disabled" && acc.Status != "expired" {
 			return acc, true
 		}
@@ -564,7 +686,7 @@ func (s *Store) EnsureValid(id string) (AccountToken, error) {
 	if acc.RefreshToken == "" {
 		for i, a := range s.data.Accounts {
 			if a.ID == acc.ID {
-				s.data.Accounts[i].Status = "expired"
+				s.markExpiredLocked(i)
 				_ = s.saveLocked()
 				break
 			}
@@ -602,7 +724,7 @@ func (s *Store) refreshInflight(acc AccountToken) (AccountToken, error) {
 		s.mu.Lock()
 		for i, a := range s.data.Accounts {
 			if a.ID == acc.ID {
-				s.data.Accounts[i].Status = "expired"
+				s.markExpiredLocked(i)
 				_ = s.saveLocked()
 				break
 			}
@@ -632,6 +754,85 @@ func (s *Store) refreshInflight(acc AccountToken) (AccountToken, error) {
 }
 
 func fmtExpired() error { return errors.New("token_expired: refresh token missing or expired") }
+
+// ExpiredRefreshable lists the accounts currently marked expired that still
+// hold a refresh token. Those are the only ones a background probe can revive:
+// an account without a refresh token needs a fresh sign-in, so probing it would
+// be pure noise.
+func (s *Store) ExpiredRefreshable() []AccountToken {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]AccountToken, 0)
+	for _, a := range s.data.Accounts {
+		if a.Status == "expired" && a.RefreshToken != "" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// GatewayDisabled lists the accounts a gateway rule took out of rotation:
+// "auto" (the token could not be refreshed) and "auto-upstream" (the upstream
+// refused to serve it). Both are restored the same way — by a successful real
+// request — so the repair loop probes them together. A user disable (or a
+// legacy empty reason) is never listed.
+func (s *Store) GatewayDisabled() []AccountToken {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]AccountToken, 0)
+	for _, a := range s.data.Accounts {
+		if a.ScheduleDisabled && GatewayDisabledReason(a.ScheduleDisabledBy) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// GatewayDisabledReason reports whether a disable reason was set by the gateway
+// (and may therefore be reversed by the gateway).
+func GatewayDisabledReason(reason string) bool {
+	return reason == ScheduleDisabledByAuto || reason == ScheduleDisabledByUpstream
+}
+
+// ReenableGatewayDisabled puts an account back in rotation, but ONLY when the
+// gateway was the one that disabled it. A user disable stands, and so does a
+// legacy disable with no recorded reason.
+func (s *Store) ReenableGatewayDisabled(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.data.Accounts {
+		if s.data.Accounts[i].ID != id {
+			continue
+		}
+		if !s.data.Accounts[i].ScheduleDisabled || !GatewayDisabledReason(s.data.Accounts[i].ScheduleDisabledBy) {
+			return nil
+		}
+		s.data.Accounts[i].ScheduleDisabled = false
+		s.data.Accounts[i].ScheduleDisabledBy = ""
+		return s.saveLocked()
+	}
+	return fmt.Errorf("account not found: %s", id)
+}
+
+// DisableScheduleUpstream takes an account out of rotation because the upstream
+// refused to serve it. A manual disable is never overwritten, and neither is a
+// token-expiry disable (that one is waiting on a refresh, not on the upstream).
+func (s *Store) DisableScheduleUpstream(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.data.Accounts {
+		if s.data.Accounts[i].ID != id {
+			continue
+		}
+		if s.data.Accounts[i].ScheduleDisabled {
+			return nil
+		}
+		s.data.Accounts[i].ScheduleDisabled = true
+		s.data.Accounts[i].ScheduleDisabledBy = ScheduleDisabledByUpstream
+		return s.saveLocked()
+	}
+	return fmt.Errorf("account not found: %s", id)
+}
 
 func (s *Store) RefreshAllExpired() []TokenRefreshResult {
 	s.mu.Lock()

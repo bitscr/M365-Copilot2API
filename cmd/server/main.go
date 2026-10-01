@@ -33,6 +33,7 @@ func main() {
 	s.StartAutoCleanup()
 	s.StartConvCacheGC()
 	s.RefreshExpiredTokens()
+	s.StartAccountRecovery()
 	// Default to all interfaces: the common deployment is behind a reverse
 	// proxy, container port mapping, or a tunnel, where binding loopback makes
 	// the service unreachable. The console-managed listenAddress in

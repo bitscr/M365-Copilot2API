@@ -550,7 +550,7 @@ if (response.output_text) {
               </div>
             </div>
           </div>
-          <div class="card-body" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line)"><label style="display:flex;align-items:center;gap:6px;font-size:12px"><input id="accountSelectAll" type="checkbox" onchange="selectAllAccounts(this.checked)"> Select all</label><span id="accountSelectionCount" class="form-hint" style="margin:0">0 selected</span><button class="btn-sm btn" onclick="batchAccounts({scheduling:true})">Enable sched</button><button class="btn-sm btn danger" onclick="batchAccounts({scheduling:false})">Disable sched</button><button class="btn-sm btn" onclick="batchAccounts({webSearch:true})">Search on</button><button class="btn-sm btn danger" onclick="batchAccounts({webSearch:false})">Search off</button><input class="form-input" id="batchSystemPrompt" placeholder="System prompt for selected…" style="flex:1;min-width:160px;padding:6px 10px;font-size:12px"><button class="btn-sm btn primary" onclick="applyBatchSystemPrompt()">Apply prompt</button><button class="btn-sm btn" onclick="clearBatchSystemPrompt()">Clear prompt</button></div>
+          <div class="card-body" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line)"><label style="display:flex;align-items:center;gap:6px;font-size:12px"><input id="accountSelectAll" type="checkbox" onchange="selectAllAccounts(this.checked)"> Select all</label><span id="accountSelectionCount" class="form-hint" style="margin:0">0 selected</span><button class="btn-sm btn" onclick="batchAccounts({scheduling:true})">Enable sched</button><button class="btn-sm btn danger" onclick="batchAccounts({scheduling:false})">Disable sched</button><button class="btn-sm btn" onclick="batchAccounts({webSearch:true})">Search on</button><button class="btn-sm btn danger" onclick="batchAccounts({webSearch:false})">Search off</button><input class="form-input" id="batchSystemPrompt" placeholder="System prompt for selected…" style="flex:1;min-width:160px;padding:6px 10px;font-size:12px"><button class="btn-sm btn primary" onclick="applyBatchSystemPrompt()">Apply prompt</button><button class="btn-sm btn" onclick="clearBatchSystemPrompt()">Clear prompt</button><button class="btn-sm btn danger" onclick="deleteSelectedAccounts()">Delete selected</button></div>
           <div class="table-wrap"><table class="table"><thead><tr><th></th><th>Account</th><th>Calls</th><th>Status</th><th>Updated</th><th>Scheduling</th><th>Proxy</th><th>Actions</th></tr></thead><tbody id="accountRows"><tr><td colspan="8" class="empty">Loading...</td></tr></tbody></table></div>
         </div>
       </section>
@@ -610,7 +610,7 @@ if (response.output_text) {
         </div>
         <div class="card">
           <div class="card-head"><span class="card-title">Proxy list</span></div>
-          <div class="table-wrap"><table class="table"><thead><tr><th>URL</th><th>Status</th><th>Latency</th><th>Failures</th><th>Cooldown until</th><th>Actions</th></tr></thead><tbody id="proxyRows"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody></table></div>
+          <div class="table-wrap"><table class="table"><thead><tr><th>URL</th><th>Status</th><th>Latency</th><th>Successes</th><th>Failures</th><th>Cooldown until</th><th>Actions</th></tr></thead><tbody id="proxyRows"><tr><td colspan="7" class="empty">Loading...</td></tr></tbody></table></div>
         </div>
       </section>
 
@@ -686,6 +686,21 @@ if (response.output_text) {
         <h3>View API key</h3>
         <p class="subtitle" id="viewKeyName"></p>
       </div>
+      <button class="modal-close" onclick="closeViewKey()"><i data-lucide="x" style="width:15px;height:15px"></i></button>
+    </div>
+    <div id="viewKeyLoading" style="color:var(--muted);font-size:13px">Loading…</div>
+    <div id="viewKeyResult" style="display:none">
+      <div class="copy-field">
+        <input class="form-input" id="viewKeyValue" readonly onclick="this.select()">
+        <button class="btn btn-sm" onclick="copyViewKey()">Copy</button>
+      </div>
+      <div class="form-hint" style="margin-top:10px">此密钥以明文保存于服务器（文件权限 0600），可随时在此查看。若泄露，请在 Edit 中更换。</div>
+    </div>
+    <div id="viewKeyLegacy" style="display:none">
+      <div class="highlight-box">此密钥创建于可查看功能上线之前，明文无法恢复。请在 Edit 中更换密钥以获取可查看的值。</div>
+    </div>
+  </div>
+</div>
 
 <!-- Edit Key Modal -->
 <div class="modal-overlay" id="editKeyModal">
@@ -866,6 +881,7 @@ const localeText={
   '; usernames and passwords are supported': {'zh-CN':'，可带用户名密码','zh-TW':'，可帶使用者名稱密碼','ja':'；ユーザー名とパスワードに対応','ko':'; 사용자 이름 및 비밀번호 지원','es':'; se admiten nombres de usuario y contraseñas','fr':'; noms d\'utilisateur et mots de passe pris en charge','de':'; Benutzernamen und Passwörter werden unterstützt','pt-BR':'; nomes de usuário e senhas são suportados','ru':'; поддерживаются имена пользователей и пароли','ar':'؛ يُدعم أسماء المستخدمين وكلمات المرور'},
   'Proxy list': {'zh-CN':'代理列表','zh-TW':'代理列表','ja':'プロキシ一覧','ko':'프록시 목록','es':'Lista de proxies','fr':'Liste des proxys','de':'Proxy-Liste','pt-BR':'Lista de proxies','ru':'Список прокси','ar':'قائمة البروكسي'},
   'URL': {'zh-CN':'地址','zh-TW':'位址','ja':'URL','ko':'URL','es':'URL','fr':'URL','de':'URL','pt-BR':'URL','ru':'URL','ar':'العنوان'},
+  'Successes': {'zh-CN':'成功次数','zh-TW':'成功次數','ja':'成功回数','ko':'성공 횟수','es':'Éxitos','fr':'Réussites','de':'Erfolge','pt-BR':'Sucessos','ru':'Успехи','ar':'مرات النجاح'},
   'Failures': {'zh-CN':'失败次数','zh-TW':'失敗次數','ja':'失敗回数','ko':'실패 횟수','es':'Fallos','fr':'Échecs','de':'Fehlversuche','pt-BR':'Falhas','ru':'Сбои','ar':'مرات الفشل'},
   'Cooldown until': {'zh-CN':'冷却至','zh-TW':'冷卻至','ja':'クールダウンまで','ko':'쿨다운까지','es':'Enfriamiento hasta','fr':'Temps d\'attente jusqu\'à','de':'Abkühlung bis','pt-BR':'Resfriamento até','ru':'До окончания ожидания','ar':'حتى انتهاء التهدئة'},
   'Send a minimal request to each model to verify availability': {'zh-CN':'对各模型发送最小请求，验证可用性','zh-TW':'對各模型傳送最小要求，驗證可用性','ja':'各モデルに最小リクエストを送信して可用性を確認','ko':'각 모델에 최소 요청을 보내 가용성 확인','es':'Envíe una solicitud mínima a cada modelo para verificar su disponibilidad','fr':'Envoyez une requête minimale à chaque modèle pour vérifier la disponibilité','de':'Senden Sie eine minimale Anfrage an jedes Modell, um die Verfügbarkeit zu prüfen','pt-BR':'Envie uma solicitação mínima a cada modelo para verificar a disponibilidade','ru':'Отправьте минимальный запрос каждой модели для проверки доступности','ar':'أرسل طلبًا بسيطًا لكل نموذج للتحقق من توفره'},
@@ -967,6 +983,8 @@ const localeText={
   'Search off': {'zh-CN':'关闭搜索'},
   'Apply prompt': {'zh-CN':'应用提示词'},
   'Clear prompt': {'zh-CN':'清除提示词'},
+  'Delete selected': {'zh-CN':'删除所选'},
+  'Auto': {'zh-CN':'自动'},
   'OK': {'zh-CN':'确定'},
   'System prompt for selected…': {'zh-CN':'选中账号的系统提示词…'}
 };
@@ -1195,7 +1213,9 @@ function renderAccounts(){
     const flags=`<div style="display:flex;gap:4px;margin-top:4px;flex-wrap:wrap">${searchEnabled?'':'<span class="status warn"><i></i>No search</span>'}${x.systemPrompt?'<span class="status online"><i></i>Custom prompt</span>':''}</div>`;
     const proxyLabel=x.boundProxy?`<span style="font-size:11px;word-break:break-all">${esc(x.boundProxy)}</span>`:'<span style="color:var(--muted);font-size:11px">—</span>';
     const checked=_accountSelection.has(x.id)?' checked':'';
-    return `<tr><td><input type="checkbox" data-account-select value="${esc(x.id)}"${checked} onchange="toggleAccountSelect('${x.id}',this.checked)"></td><td><div class="account-cell"><div class="avatar">${(x.displayName||x.email||'M')[0]}</div><div><b>${x.displayName||x.email}</b><div style="font-size:11px;color:var(--muted)">${x.email||''}</div>${flags}</div></div></td><td style="font-size:12px;white-space:nowrap">${calls}</td><td>${status}</td><td style="font-size:12px;color:var(--muted)">${x.updatedAt?new Date(x.updatedAt).toLocaleString():'-'}</td><td><button class="btn-sm btn${scheduleEnabled?'':' danger'}" onclick="toggleAccountSchedule('${x.id}',${!scheduleEnabled})">${scheduleEnabled?'Enabled':'Disabled'}</button></td><td>${proxyLabel} <button class="btn-sm btn" style="margin-top:2px" onclick="bindAccountProxy('${x.id}','${esc(x.boundProxy||'')}')">Bind</button></td><td><button class="btn-sm btn danger" onclick="deleteAccount('${x.id}')">Delete</button></td></tr>`;
+    const autoReason=x.scheduleDisabledBy||'';
+    const autoTag=!scheduleEnabled&&autoReason.startsWith('auto')?` <span class="status warn" title="${autoReason==='auto-upstream'?'Disabled automatically: the upstream refused to serve this account':'Disabled automatically after a failed token refresh'}"><i></i>Auto</span>`:'';
+    return `<tr><td><input type="checkbox" data-account-select value="${esc(x.id)}"${checked} onchange="toggleAccountSelect('${x.id}',this.checked)"></td><td><div class="account-cell"><div class="avatar">${(x.displayName||x.email||'M')[0]}</div><div><b>${x.displayName||x.email}</b><div style="font-size:11px;color:var(--muted)">${x.email||''}</div>${flags}</div></div></td><td style="font-size:12px;white-space:nowrap">${calls}</td><td>${status}</td><td style="font-size:12px;color:var(--muted)">${x.updatedAt?new Date(x.updatedAt).toLocaleString():'-'}</td><td><button class="btn-sm btn${scheduleEnabled?'':' danger'}" onclick="toggleAccountSchedule('${x.id}',${!scheduleEnabled})">${scheduleEnabled?'Enabled':'Disabled'}</button>${autoTag}</td><td>${proxyLabel} <button class="btn-sm btn" style="margin-top:2px" onclick="bindAccountProxy('${x.id}','${esc(x.boundProxy||'')}')">Bind</button></td><td><button class="btn-sm btn danger" onclick="deleteAccount('${x.id}')">Delete</button></td></tr>`;
   }).join(''):'<tr><td colspan="8" class="empty">No matching accounts</td></tr>';
 }
 const _accountSelection=new Set();
@@ -1240,6 +1260,18 @@ async function deleteAccount(id){
   if(!confirm('确定删除此账号？'))return;
   try{await api('/api/accounts/delete',{method:'POST',body:JSON.stringify({id})});showNotice('已删除','success');loadAccounts();showPage('dashboard');}
   catch(e){showNotice(e.message,'error');}
+}
+
+async function deleteSelectedAccounts(){
+  const ids=selectedAccountIDs();
+  if(!ids.length){showNotice('Select at least one account','error');return;}
+  if(!confirm('确定删除已选的 '+ids.length+' 个账号？此操作不可恢复。'))return;
+  try{
+    const r=await api('/api/accounts/batch',{method:'POST',body:JSON.stringify({ids,delete:true})});
+    _accountSelection.clear();updateAccountSelectionCount();
+    showNotice('Deleted '+r.deleted+' accounts','success');
+    await loadAccounts();
+  }catch(e){showNotice(e.message,'error');}
 }
 
 function bindAccountProxy(id,current){
@@ -1623,6 +1655,7 @@ function proxyRow(x){
     <td><code style="font-size:12px">${esc(x.url)}</code>${inCooldown?'<div style="font-size:11px;color:var(--muted)">Cooling down</div>':''}</td>
     <td>${badge}</td>
     <td style="font-size:12px;color:var(--muted)">${x.latencyMs>0?x.latencyMs+' ms':'-'}</td>
+    <td style="font-size:12px;color:var(--muted)">${x.successes||0}</td>
     <td style="font-size:12px;color:var(--muted)">${x.failures||0}</td>
     <td style="font-size:12px;color:var(--muted)">${x.cooldownUntil?new Date(x.cooldownUntil).toLocaleString():'-'}</td>
     <td style="text-align:right;white-space:nowrap">

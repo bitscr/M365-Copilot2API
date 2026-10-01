@@ -95,8 +95,18 @@ func (c *accountConcurrency) Inflight(accountID string) int {
 }
 
 func (s *Server) accountAvailable(accountID string) bool {
-	if s.tokens != nil && !s.tokens.ScheduleEnabled(accountID) {
-		return false
+	if s.tokens != nil {
+		if !s.tokens.ScheduleEnabled(accountID) {
+			return false
+		}
+		// An EXPIRED account has dead credentials: it still passes the health
+		// table, but every request pinned to it dies on the token refresh with
+		// a 502. Treat it as unavailable so sticky bindings (context affinity,
+		// sessions, conversation pins) fall back to a healthy account instead of
+		// dragging the request onto a dead one.
+		if acc, ok := s.tokens.Get(accountID); !ok || acc.Status == "expired" {
+			return false
+		}
 	}
 	return s.accountPool.Available(accountID) && s.accountConcurrency.Available(accountID)
 }

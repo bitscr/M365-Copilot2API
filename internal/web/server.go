@@ -83,7 +83,18 @@ func (s *Server) logThrottlingWarning(accountID string, throttling any) {
 }
 
 func (s *Server) markAccountResult(accountID string, err error) {
-	if s == nil || s.accountPool == nil || accountID == "" {
+	if s == nil || accountID == "" {
+		return
+	}
+	// Upstream-availability guard. It runs before the health table (and without
+	// it) because accountHealth books only a short cooldown for a refusal the
+	// upstream repeats on every single request.
+	if isUpstreamRejection(err) {
+		s.noteUpstreamRejection(accountID, err)
+	} else if err == nil {
+		s.clearUpstreamRejections(accountID)
+	}
+	if s.accountPool == nil {
 		return
 	}
 	if err != nil {
@@ -191,6 +202,21 @@ type Server struct {
 	retryDedupMtx   sync.Mutex
 	retryDedup      map[string]retryDedupEntry
 	contextAffinity *contextAffinity
+
+	// accountRecovery tracks the per-account retry schedule of the background
+	// probe that tries to bring expired accounts back online.
+	accountRecoveryMtx sync.Mutex
+	accountRecovery    map[string]*accountRecoveryState
+
+	// accountRejects counts consecutive upstream rejections per account; the
+	// upstream-availability guard disables an account when the streak reaches
+	// accountRejectThreshold().
+	accountRejectsMtx sync.Mutex
+	accountRejects    map[string]int
+
+	// upstreamProbe overrides the real one-word chat request used to test an
+	// account the upstream refused. Test seam only; nil in production.
+	upstreamProbe func(auth.AccountToken) error
 }
 
 type retryDedupEntry struct {
@@ -790,6 +816,7 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		DisplayName        string         `json:"displayName,omitempty"`
 		Status             string         `json:"status"`
 		ScheduleEnabled    bool           `json:"scheduleEnabled"`
+		ScheduleDisabledBy string         `json:"scheduleDisabledBy,omitempty"`
 		WebSearchEnabled   bool           `json:"webSearchEnabled"`
 		SystemPrompt       string         `json:"systemPrompt,omitempty"`
 		CallCount          uint64         `json:"callCount"`
@@ -837,7 +864,8 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		out = append(out, view{
 			ID: a.ID, Email: a.Email, DisplayName: a.DisplayName,
 			Status: status, ScheduleEnabled: !a.ScheduleDisabled,
-			WebSearchEnabled: !a.WebSearchDisabled, SystemPrompt: a.SystemPrompt,
+			ScheduleDisabledBy: a.ScheduleDisabledBy,
+			WebSearchEnabled:   !a.WebSearchDisabled, SystemPrompt: a.SystemPrompt,
 			CallCount: callCount, RateLimited: rateLimited,
 			ImageLimited:   imageLimited,
 			AuthFailed:     s.accountPool != nil && !s.accountPool.Available(a.ID) && authFailReason != "",
@@ -905,9 +933,23 @@ func (s *Server) batchAccounts(w http.ResponseWriter, r *http.Request) {
 		Scheduling   *bool    `json:"scheduling"`
 		WebSearch    *bool    `json:"webSearch"`
 		SystemPrompt *string  `json:"systemPrompt"`
+		Delete       bool     `json:"delete"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "bad json")
+		return
+	}
+	if body.Delete {
+		if body.Scheduling != nil || body.WebSearch != nil || body.SystemPrompt != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "delete cannot be combined with other changes")
+			return
+		}
+		n, err := s.tokens.DeleteAccounts(body.IDs)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		jsonOut(w, map[string]any{"status": "deleted", "deleted": n})
 		return
 	}
 	if body.Scheduling == nil && body.WebSearch == nil && body.SystemPrompt == nil {
@@ -1500,11 +1542,15 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 	}
 	// A client-supplied conversation id pins the owning account; never let the
 	// pool round-robin a conversation onto a different account, which would
-	// bind one channel while the answer lands on another (empty reply).
+	// bind one channel while the answer lands on another (empty reply). If that
+	// account is gone the id is dropped so the request can start a fresh
+	// conversation instead of failing (see pinConversationAccount).
 	if body.ConversationID != "" && body.AccountID == "" {
-		if sess, ok := s.sessionResolver.GetConversation(body.ConversationID); ok && sess.AccountID != "" {
-			body.AccountID = sess.AccountID
-			log.Printf("[session-resolver] conversation-bound account=%s conversation=%s", sess.AccountID, body.ConversationID)
+		pinned, keep := s.pinConversationAccount(body.ConversationID)
+		if !keep {
+			body.ConversationID = ""
+		} else if pinned != "" {
+			body.AccountID = pinned
 		}
 	}
 	acc, err := s.resolveAccount(body.AccountID)
@@ -1884,6 +1930,45 @@ func isBareNoToolNeeded(text string) bool {
 	return strings.EqualFold(t, "NO_TOOL_NEEDED")
 }
 
+// noToolNeededSummaryCorrection forces a real summary out of a model that
+// answered a completed tool loop with the bare NO_TOOL_NEEDED stop token.
+//
+// 2026-09-28 deadlock: the gateway normalized the bare token to an empty 200
+// and relied on the CLIENT to inject a retry turn. The client did retry — but
+// the replayed conversation deterministically produced bare NO_TOOL_NEEDED
+// again (observed 3/3 on conversation 83a22010: 22:36:07, 22:36:26, 22:36:56),
+// and a 4th attempt hit three empty completions -> 502. The user saw
+// "No reply: gpt-5.6-reasoning didn't produce a reply this time, even after
+// retries". Delegating recovery to a client that provably cannot supply it
+// dead-ends the turn, so the gateway now re-asks itself.
+func noToolNeededSummaryCorrection(prompt string) string {
+	return "STRICT FORMAT: Your previous reply was the bare stop token NO_TOOL_NEEDED with no content. That is not an acceptable answer. Write the final summary NOW, in the language the user is using, as plain text: what you actually did, what the tool results showed (quote the concrete values, paths, HTTP status codes, and error strings you received), and what remains unverified. Do not call any tool. Do not output NO_TOOL_NEEDED. Do not describe an execution environment. An honest account of a failed or partial run is required — never an empty reply.\n\nConversation to summarize:\n" + prompt
+}
+
+// resolveBareNoToolNeeded re-asks the upstream once for a real summary when it
+// answered with the bare NO_TOOL_NEEDED stop token. Returns the replacement
+// text and true when a usable answer was recovered; false when the caller
+// should keep its existing empty-reply behavior.
+//
+// Only used on the NON-STREAM path: the stream path has already committed its
+// terminal frames by the time the end-of-stream check runs, so it cannot
+// re-ask without emitting a second [DONE].
+func (s *Server) resolveBareNoToolNeeded(ctx context.Context, accID string, account chathub.Account, prompt string, tone string, body *oaiReq, toolCfg runtimeSettings) (string, bool) {
+	res, err := s.chatWithAccount(ctx, accID, account, chathub.Request{
+		Text:           noToolNeededSummaryCorrection(prompt),
+		Tone:           tone,
+		Attachments:    body.Attachments,
+		LicenseType:    toolCfg.LicenseType,
+		Scenario:       toolCfg.Scenario,
+		ConversationID: body.ConversationID,
+		SessionID:      body.SessionID,
+	})
+	if err != nil || isBareNoToolNeeded(res.Text) || strings.TrimSpace(res.Text) == "" {
+		return "", false
+	}
+	return res.Text, true
+}
+
 func contentToString(c any) string {
 	switch v := c.(type) {
 	case string:
@@ -2219,27 +2304,38 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	if body.ConversationID == "" && len(body.Messages) > 0 && (body.Metadata == nil || !body.Metadata.CopilotTempSession) {
 		resolved := s.sessionResolver.Resolve(r, &body)
 		if !resolved.IsNew {
-			resolvedConversationID = resolved.ConversationID
-			body.ConversationID = resolved.ConversationID
-			body.SessionID = resolved.SessionID
-			// The resolved conversation belongs to exactly one account; a
-			// client-supplied accountId must not override it, or the request
-			// would be sent to D while the conversation lives on C.
-			if resolved.AccountID != "" {
-				body.AccountID = resolved.AccountID
+			// The bound account may have gone away since the session was
+			// created (expired token, gateway disable, quota). Its cloud
+			// conversation cannot be continued by another account, so do not
+			// pin the request to it: start a fresh cloud conversation on a
+			// healthy account instead of returning a 502. The client resends
+			// its full history and the next Bind() repoints the session at the
+			// new account + conversation, so this heals itself.
+			if resolved.AccountID != "" && !s.accountAvailable(resolved.AccountID) {
+				log.Printf("[session-resolver] matched=%s conversation=%s bound to unusable account=%s -> starting a new cloud conversation", resolved.MatchedBy, resolved.ConversationID, resolved.AccountID)
 			} else {
-				body.AccountID = firstNonEmpty(body.AccountID, resolved.AccountID)
-			}
-			log.Printf("[session-resolver] matched=%s conversation=%s history=%d total=%d", resolved.MatchedBy, resolved.ConversationID, resolved.HistoryLen, len(body.Messages))
-			// Plan A: full-context continuation. Sending only the incremental
-			// tail (messages[HistoryLen:]) with a stale ConversationID makes
-			// the upstream M365 open a BRAND-NEW cloud conversation (new ID
-			// returned, old binding orphaned, context lost, account drift).
-			// Keep the complete flattened history in answerPrompt so the
-			// upstream sees the whole thread and continues the same
-			// conversation; HistoryLen remains for logging only.
-			if resolved.HistoryLen > 0 && resolved.HistoryLen < len(body.Messages) {
-				log.Printf("[session-resolver] full-context continuation history=%d total=%d", resolved.HistoryLen, len(body.Messages))
+				resolvedConversationID = resolved.ConversationID
+				body.ConversationID = resolved.ConversationID
+				body.SessionID = resolved.SessionID
+				// The resolved conversation belongs to exactly one account; a
+				// client-supplied accountId must not override it, or the request
+				// would be sent to D while the conversation lives on C.
+				if resolved.AccountID != "" {
+					body.AccountID = resolved.AccountID
+				} else {
+					body.AccountID = firstNonEmpty(body.AccountID, resolved.AccountID)
+				}
+				log.Printf("[session-resolver] matched=%s conversation=%s history=%d total=%d", resolved.MatchedBy, resolved.ConversationID, resolved.HistoryLen, len(body.Messages))
+				// Plan A: full-context continuation. Sending only the incremental
+				// tail (messages[HistoryLen:]) with a stale ConversationID makes
+				// the upstream M365 open a BRAND-NEW cloud conversation (new ID
+				// returned, old binding orphaned, context lost, account drift).
+				// Keep the complete flattened history in answerPrompt so the
+				// upstream sees the whole thread and continues the same
+				// conversation; HistoryLen remains for logging only.
+				if resolved.HistoryLen > 0 && resolved.HistoryLen < len(body.Messages) {
+					log.Printf("[session-resolver] full-context continuation history=%d total=%d", resolved.HistoryLen, len(body.Messages))
+				}
 			}
 		}
 	}
@@ -2249,9 +2345,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// lands elsewhere — the empty-conversation symptom). Resolve the binding
 	// back to its account before the pool gets a chance to round-robin.
 	if body.ConversationID != "" && body.AccountID == "" {
-		if sess, ok := s.sessionResolver.GetConversation(body.ConversationID); ok && sess.AccountID != "" {
-			body.AccountID = sess.AccountID
-			log.Printf("[session-resolver] conversation-bound account=%s conversation=%s", sess.AccountID, body.ConversationID)
+		pinned, keep := s.pinConversationAccount(body.ConversationID)
+		if !keep {
+			body.ConversationID = ""
+		} else if pinned != "" {
+			body.AccountID = pinned
 		}
 	}
 	if body.AccountID == "" && s.contextAffinity != nil {
@@ -2621,20 +2719,17 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			retryRes, retryErr := s.retryEjectedStream(ctx, acc.ID, account, prompt, tone, &body, toolCfg, toolMaps)
 			if retryErr != nil {
 				log.Printf("[sandbox-eject] id=%s correction retry failed: %v", requestID, retryErr)
-				code, msg := actionableUpstreamError(retryErr)
-				msg = sanitizePublicInternalText(msg)
-				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": code}})+"\n\n")
-				_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
+				// Do NOT end the turn with an SSE error frame: the client has no
+				// content to show, retries, and the conversation dies with "No reply".
+				// End it with an honest assistant message instead.
+				log.Printf("[eject-fallback] id=%s correction retry failed: %v; ending turn with honest fallback", requestID, retryErr)
+				writeEjectFallbackStream(r.Context(), w, flusher, id, model, ejectExhaustedHonestText(len(toolMaps) > 0))
 				return
 			}
 			if executionEjectTrigger(retryRes.Text, toolMaps) {
 				log.Printf("[sandbox-eject] id=%s upstream kept claiming container execution after correction retries", requestID)
-				msg := "upstream repeatedly claimed sandbox/container execution instead of returning a tool call"
-				if len(toolMaps) == 0 {
-					msg = "upstream repeatedly claimed it executed commands and reported container output; refusing to relay fabricated results"
-				}
-				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "upstream_error"}})+"\n\n")
-				_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
+				log.Printf("[eject-fallback] id=%s kept claiming container execution after corrections; ending turn with honest fallback", requestID)
+				writeEjectFallbackStream(r.Context(), w, flusher, id, model, ejectExhaustedHonestText(len(toolMaps) > 0))
 				return
 			}
 			calls, _ := validateCalls("sandbox-eject", fencedToolCalls(retryRes.Text, toolMaps, body.ToolChoice))
@@ -2879,11 +2974,29 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		_ = flushText()
 		if holdActive && held != "" {
 			if isBareNoToolNeeded(held) {
-				// Bare NO_TOOL_NEEDED never reaches the client as answer text
-				// — normalize to empty so Hermes injects its retry turn and
-				// forces a real summary (mirrors the non-stream path).
-				log.Printf("[answer-empty] id=%s stream end bare NO_TOOL_NEEDED, dropping to trigger client retry", requestID)
-				holdActive = false
+				// Bare NO_TOOL_NEEDED never reaches the client as answer text.
+				// The old fix normalized it to empty and relied on the CLIENT
+				// injecting a retry turn — but the replayed conversation
+				// reproduced the same bare token every time (3/3 on
+				// conversation 83a22010, 2026-09-28) and the next attempt
+				// 502'd, surfacing as "No reply ... even after retries".
+				// The terminal frames below have NOT been written yet, so the
+				// gateway can still re-ask and emit a real summary here.
+				if fixed, ok := s.resolveBareNoToolNeeded(ctx, acc.ID, account, prompt, tone, &body, toolCfg); ok {
+					log.Printf("[answer-empty] id=%s stream end bare NO_TOOL_NEEDED, recovered summary via gateway re-ask (%d bytes)", requestID, len(fixed))
+					holdActive = false
+					if err := emitText(fixed); err != nil {
+						return
+					}
+					if err := flushText(); err != nil {
+						return
+					}
+				} else {
+					// Fall back to the empty reply so Hermes still gets its
+					// retry turn.
+					log.Printf("[answer-empty] id=%s stream end bare NO_TOOL_NEEDED, dropping to trigger client retry", requestID)
+					holdActive = false
+				}
 			} else {
 				// End-of-stream flush for the sliding window: short answers that
 				// never exceeded the tail window must still reach the client.
@@ -3152,20 +3265,17 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			retryRes, retryErr := s.retryEjectedStream(ctx, acc.ID, account, prompt, tone, &body, toolCfg, toolMaps)
 			if retryErr != nil {
 				log.Printf("[sandbox-eject] id=%s correction retry failed: %v", requestID, retryErr)
-				code, msg := actionableUpstreamError(retryErr)
-				msg = sanitizePublicInternalText(msg)
-				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": code}})+"\n\n")
-				_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
+				// Do NOT end the turn with an SSE error frame: the client has no
+				// content to show, retries, and the conversation dies with "No reply".
+				// End it with an honest assistant message instead.
+				log.Printf("[eject-fallback] id=%s correction retry failed: %v; ending turn with honest fallback", requestID, retryErr)
+				writeEjectFallbackStream(r.Context(), w, flusher, id, model, ejectExhaustedHonestText(len(toolMaps) > 0))
 				return
 			}
 			if executionEjectTrigger(retryRes.Text, toolMaps) {
 				log.Printf("[sandbox-eject] id=%s upstream kept claiming container execution after correction retries", requestID)
-				msg := "upstream repeatedly claimed sandbox/container execution instead of returning a tool call"
-				if len(toolMaps) == 0 {
-					msg = "upstream repeatedly claimed it executed commands and reported container output; refusing to relay fabricated results"
-				}
-				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "upstream_error"}})+"\n\n")
-				_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
+				log.Printf("[eject-fallback] id=%s kept claiming container execution after corrections; ending turn with honest fallback", requestID)
+				writeEjectFallbackStream(r.Context(), w, flusher, id, model, ejectExhaustedHonestText(len(toolMaps) > 0))
 				return
 			}
 			calls, _ := validateCalls("sandbox-eject-r", fencedToolCalls(retryRes.Text, toolMaps, body.ToolChoice))
@@ -3562,11 +3672,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 		if executionEjectTrigger(res.Text, toolMaps) {
 			log.Printf("[tool-eject] id=%s upstream kept refusing tools / claiming container execution after retries", requestID)
-			msg := "upstream refused to use the caller's declared tools and claimed execution in its own container instead; no tool call was produced. Retry or check the upstream model's tool support."
-			if len(toolMaps) == 0 {
-				msg = "upstream claimed it executed commands and reported container output although no execution tool was attached; refusing to relay fabricated results. Retry with a declared tool or ask the caller to run commands locally."
-			}
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", msg)
+			// 502 here is what surfaces as "No reply ... even after retries".
+			// End the turn with an honest assistant message instead.
+			log.Printf("[eject-fallback] id=%s non-stream exhaustion; answering honestly instead of 502", requestID)
+			writeEjectFallbackCompletion(w, id, model, ejectExhaustedHonestText(len(toolMaps) > 0))
 			return
 		}
 	}
@@ -3635,8 +3744,20 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		// "You just executed tool calls but returned an empty response"
 		// retry turn, which forces the model to actually summarize the tool
 		// results — the task continues instead of stopping dead.
-		log.Printf("[answer-empty] id=%s bare NO_TOOL_NEEDED, returning empty to trigger client retry", requestID)
-		res.Text = ""
+		//
+		// 2026-09-28: that client-side recovery dead-ended. The replayed
+		// conversation reproduced bare NO_TOOL_NEEDED every time (3/3 on
+		// conversation 83a22010) and the next attempt 502'd, surfacing as
+		// "No reply ... even after retries". Re-ask here first, on the same
+		// account and conversation, and only fall back to the empty reply if
+		// the model still refuses to summarize.
+		if fixed, ok := s.resolveBareNoToolNeeded(ctx, acc.ID, account, prompt, tone, &body, toolCfg); ok {
+			log.Printf("[answer-empty] id=%s bare NO_TOOL_NEEDED, recovered summary via gateway re-ask (%d bytes)", requestID, len(fixed))
+			res.Text = fixed
+		} else {
+			log.Printf("[answer-empty] id=%s bare NO_TOOL_NEEDED, returning empty to trigger client retry", requestID)
+			res.Text = ""
+		}
 	}
 	if isContentPolicyBlock(res.Text) {
 		log.Printf("[content-policy] M365 blocked the request, returning 503")
