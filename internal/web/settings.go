@@ -32,6 +32,7 @@ var configurableCodexModels = []string{
 	"gpt-5.4-mini",
 	"gpt-5.5",
 	"gpt-5.6-reasoning",
+	"gpt-image-2",
 	"flux-3",
 	"flux-4",
 	"codex-auto-review",

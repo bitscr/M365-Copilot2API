@@ -542,7 +542,11 @@ func executionIntent(text string) bool {
 // flows through, while fake container output is dropped.
 func executionEjectTrigger(text string, toolMaps []map[string]any) bool {
 	if len(toolMaps) > 0 {
-		return isToolRefusal(text) || isSandboxHallucination(text) || isExternalAccessClaim(text)
+		// A denial of the caller's tools is false by construction — the
+		// gateway handed them over. Checked ahead of the keyword tiers
+		// because isToolRefusal bails on text >= 200 chars, so a verbose
+		// denial (the 834-char 2026-09-29 case) slips past everything else.
+		return isToolDenialClaim(text) || isToolRefusal(text) || isSandboxHallucination(text) || isExternalAccessClaim(text)
 	}
 	return isSandboxClaim(text)
 }

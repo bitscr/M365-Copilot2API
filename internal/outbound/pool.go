@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -13,7 +14,15 @@ import (
 )
 
 type poolEntry struct {
-	raw       string
+	raw string
+	// successes counts dials that completed through this proxy. Surfaced
+	// next to failures so a pool that is configured and healthy can be told
+	// apart from one that is healthy but never actually carrying traffic.
+	successes int64
+	// proxyURL is the parsed form of raw. gorilla/websocket only performs the
+	// CONNECT handshake for proxies supplied via Dialer.Proxy; the pool has to
+	// know the URL to hand it back at dial time.
+	proxyURL  *url.URL
 	clients   *Clients
 	failures  int
 	cooldown  time.Time
@@ -40,7 +49,11 @@ func NewPool(raw []string) (*Pool, error) {
 			return nil, fmt.Errorf("proxy %q: %w", v, err)
 		}
 		seen[v] = true
-		p.entries = append(p.entries, &poolEntry{raw: v, clients: c})
+		entry := &poolEntry{raw: v, clients: c}
+		if u, err := url.Parse(v); err == nil {
+			entry.proxyURL = u
+		}
+		p.entries = append(p.entries, entry)
 	}
 	return p, nil
 }
@@ -109,6 +122,7 @@ func (p *Pool) mark(raw string, err error) {
 	for _, e := range p.entries {
 		if e.raw == raw {
 			if err == nil {
+				e.successes++
 				e.failures = 0
 				e.cooldown = time.Time{}
 				e.lastError = ""
@@ -160,22 +174,55 @@ func (p *Pool) WebSocketDialer() *websocket.Dialer {
 	}
 	var mu sync.Mutex
 	var sticky *poolEntry
-	base.NetDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+	entry := func() *poolEntry {
 		mu.Lock()
-		e := sticky
-		if e == nil {
-			e = p.pick()
-			sticky = e
+		defer mu.Unlock()
+		if sticky == nil {
+			sticky = p.pick()
 		}
-		mu.Unlock()
+		return sticky
+	}
+	// A plain http:// proxy is wired into the dialer as Dialer.Proxy
+	// (see New): gorilla/websocket performs the CONNECT handshake itself, but
+	// only when Proxy is set. The previous implementation borrowed just
+	// NetDialContext from the entry, which for http proxies is still the
+	// direct dialer left over from directClients() — so every WebSocket dial
+	// silently bypassed the proxy and hit the origin over its own IP.
+	// Verified 2026-09-29: with http://43.132.180.193:8818 configured and
+	// healthy in the console, the gateway connected straight to
+	// substrate.office.com over IPv6 (2603:1026::/32) and never opened a
+	// single socket to the proxy. https:// and socks5:// set NetDialContext
+	// themselves and were unaffected.
+	//
+	// Both shapes are honored now: http exposes the proxy through Proxy (and
+	// NetDialContext then dials the PROXY's address); https/socks5 tunnel
+	// through their own NetDialContext and must report no proxy URL.
+	base.Proxy = func(*http.Request) (*url.URL, error) {
+		e := entry()
+		if e == nil || e.clients.WebSocket.Proxy == nil {
+			return nil, nil
+		}
+		return e.proxyURL, nil
+	}
+	base.NetDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		e := entry()
 		if e == nil {
 			return baseDial(ctx, network, address)
 		}
-		dial := e.clients.WebSocket.NetDialContext
-		if dial == nil {
-			dial = baseDial
+		var (
+			conn net.Conn
+			err  error
+		)
+		if e.clients.WebSocket.Proxy != nil {
+			// gorilla already issued CONNECT; address is the proxy host.
+			conn, err = baseDial(ctx, network, address)
+		} else {
+			dial := e.clients.WebSocket.NetDialContext
+			if dial == nil {
+				dial = baseDial
+			}
+			conn, err = dial(ctx, network, address)
 		}
-		conn, err := dial(ctx, network, address)
 		p.mark(e.raw, err)
 		if err != nil {
 			mu.Lock()
@@ -193,7 +240,7 @@ func (p *Pool) List() []map[string]any {
 	defer p.mu.Unlock()
 	out := make([]map[string]any, 0, len(p.entries))
 	for _, e := range p.entries {
-		out = append(out, map[string]any{"url": e.raw, "failures": e.failures, "cooldownUntil": e.cooldown, "lastCheck": e.lastCheck, "latencyMs": e.latency.Milliseconds(), "lastError": e.lastError, "health": e.health})
+		out = append(out, map[string]any{"url": e.raw, "failures": e.failures, "successes": e.successes, "cooldownUntil": e.cooldown, "lastCheck": e.lastCheck, "latencyMs": e.latency.Milliseconds(), "lastError": e.lastError, "health": e.health})
 	}
 	return out
 }

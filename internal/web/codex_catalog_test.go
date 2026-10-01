@@ -147,7 +147,7 @@ func TestModelCatalogAdvertisesFluxImages(t *testing.T) {
 	seen := map[string]bool{}
 	for _, model := range modelCatalog() {
 		id, _ := model["id"].(string)
-		if id != "flux-3" && id != "flux-4" {
+		if id != "flux-3" && id != "flux-4" && id != "gpt-image-2" {
 			continue
 		}
 		seen[id] = true
@@ -158,13 +158,8 @@ func TestModelCatalogAdvertisesFluxImages(t *testing.T) {
 			t.Fatalf("%s must not advertise tool_calls", id)
 		}
 	}
-	if !seen["flux-3"] || !seen["flux-4"] {
-		t.Fatalf("flux models missing from catalog: %v", seen)
-	}
-	for _, model := range modelCatalog() {
-		if model["id"] == "gpt-image-2" {
-			t.Fatal("misleading gpt-image-2 must not be advertised")
-		}
+	if !seen["flux-3"] || !seen["flux-4"] || !seen["gpt-image-2"] {
+		t.Fatalf("image models missing from catalog: %v", seen)
 	}
 }
 

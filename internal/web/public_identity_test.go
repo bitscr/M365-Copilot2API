@@ -118,7 +118,7 @@ func TestPublicIdentityAnswerUsesRequestedModelForAllAdvertisedModels(t *testing
 	}
 	for _, model := range models {
 		switch model.ID {
-		case "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-image-2":
+		case "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna":
 			t.Fatalf("misleading model %q must not be advertised", model.ID)
 		}
 	}

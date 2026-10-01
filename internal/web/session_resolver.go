@@ -337,6 +337,7 @@ func (sr *sessionResolver) matchSuffixLocked(tenant, ipFinger string, messages [
 	}
 	best := match{}
 	minSuffix := 2
+	var tied []string
 	for id, sess := range sr.sessions {
 		if time.Since(sess.LastUsedAt) > sr.contextTTL {
 			continue
@@ -364,9 +365,25 @@ func (sr *sessionResolver) matchSuffixLocked(tenant, ipFinger string, messages [
 		// its own task. Only bind when the matched window contains a real
 		// conversational turn: a user message plus an assistant or tool
 		// message.
-		if n >= minSuffix && suffixIsConversational(hist, n) && (n > best.n || (n == best.n && sess.LastUsedAt.After(best.recent))) {
-			best = match{id: id, n: n, recent: sess.LastUsedAt}
+		if n < minSuffix || !suffixIsConversational(hist, n) {
+			continue
 		}
+		if n > best.n {
+			best, tied = match{id: id, n: n, recent: sess.LastUsedAt}, []string{id}
+		} else if n == best.n {
+			tied = append(tied, id)
+		}
+	}
+	// Identical tails (forked sessions storing byte-identical history) give
+	// every candidate the same n, and recency cannot break that tie honestly —
+	// two sessions bound in the same instant compare equal, so the winner is
+	// decided by map iteration order. Same rule as matchContextLocked: an
+	// undecidable tie must not resolve, otherwise the cross-thread bind comes
+	// back through the suffix path.
+	if len(tied) > 1 {
+		log.Printf("[session-resolver] AMBIGUOUS suffix n=%d across %d sessions (tenant=%s) — not guessing, falling through",
+			best.n, len(tied), tenant[:min(8, len(tenant))])
+		return "", 0
 	}
 	return best.id, best.n
 }
@@ -432,16 +449,37 @@ func rollingOverlapLen(hist, msgs []oaiMsg) int {
 // matchContextLocked 浠庡叏閮ㄤ細璇濅腑鎵惧埌鍏?contextHistory 涓ユ牸浣滀负娑堟伅鍓嶇紑鐨?
 // 閭ｄ釜浼氳瘽锛涘彧閫夊墠缂€鏈€闀跨殑涓€涓紝閬垮厤鐭墠缂€鍦ㄤ笉鍚屼細璇濋棿浜掓挒銆傝繑鍥?
 // (sessionID, 鍖归厤鍒扮殑娑堟伅鏉℃暟)銆?
+// prefixCandidate is one session whose stored history is a strict prefix of the
+// incoming messages.
+type prefixCandidate struct {
+	id     string
+	n      int
+	recent time.Time
+}
+
+// matchContextLocked finds the session whose stored history is a strict prefix
+// of the incoming messages — the ordinary tool-loop continuation.
+//
+// A shared prefix alone is NOT identity. Concurrent Hermes threads on one box
+// run the same system prompt, the same memory preamble and the same long tool
+// loop, so several sessions can share a ~197-message prefix and diverge only
+// at the user message (observed 2026-09-29: b08f1b6f/e5c883b3,
+// d17b75f2/677634d3 and d87ca694/69a7c53f all shared 197 identical messages).
+// The old code broke such ties on LastUsedAt, which binds a request to
+// whichever thread was touched last — the model then answers about a different
+// machine or a different task.
+//
+// When candidates tie, the incoming messages CANNOT separate them: every tied
+// candidate is a prefix of the same slice, so each implies the identical
+// continuation messages[n:]. There is no signal to prefer one. Guessing by
+// recency is a coin flip wearing a match's clothes, so we return no match and
+// let Resolve fall through to suffix matching and ultimately open a fresh
+// session — wrong-but-harmless instead of wrong-and-confident.
 func (sr *sessionResolver) matchContextLocked(tenant, ipFinger string, messages []oaiMsg) (string, int) {
 	if len(messages) == 0 {
 		return "", 0
 	}
-	type match struct {
-		id     string
-		n      int
-		recent time.Time
-	}
-	best := match{}
+	var cands []prefixCandidate
 	for id, sess := range sr.sessions {
 		if time.Since(sess.LastUsedAt) > sr.contextTTL {
 			continue
@@ -452,12 +490,34 @@ func (sr *sessionResolver) matchContextLocked(tenant, ipFinger string, messages 
 		if sess.IPFingerprint != ipFinger {
 			continue
 		}
-		n := contextPrefixLen(sess.ContextHistory, messages)
-		if n >= 1 && (n > best.n || (n == best.n && sess.LastUsedAt.After(best.recent))) {
-			best = match{id: id, n: n, recent: sess.LastUsedAt}
+		if n := contextPrefixLen(sess.ContextHistory, messages); n >= 1 {
+			cands = append(cands, prefixCandidate{id: id, n: n, recent: sess.LastUsedAt})
 		}
 	}
-	return best.id, best.n
+	if len(cands) == 0 {
+		return "", 0
+	}
+	maxN := 0
+	for _, c := range cands {
+		if c.n > maxN {
+			maxN = c.n
+		}
+	}
+	tied := 0
+	var single prefixCandidate
+	for _, c := range cands {
+		if c.n != maxN {
+			continue
+		}
+		tied++
+		single = c
+	}
+	if tied == 1 {
+		return single.id, single.n
+	}
+	log.Printf("[session-resolver] AMBIGUOUS prefix n=%d across %d sessions (tenant=%s) — not guessing, falling through",
+		maxN, tied, tenant[:min(8, len(tenant))])
+	return "", 0
 }
 
 // contextPrefixLen 杩斿洖 hist 鏄惁涓ユ牸鏄?msgs 鐨勫墠缂€銆俬ist 涓虹┖鎴栦笉鏄墠缂€
